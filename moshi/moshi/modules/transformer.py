@@ -239,6 +239,14 @@ class RingKVCache:
             this_indexes = this_indexes.expand(-1, H, T, D)
             self.cache[0].scatter_(2, this_indexes, k)
             self.cache[1].scatter_(2, this_indexes, v)
+        elif k.device.type == "mps":
+            # MPS-compatible: use scatter_ instead of index_copy_ to avoid CPU fallback
+            # See: https://github.com/Lightning-AI/litgpt/pull/1724
+            # indexes[0] is [T], need to expand to [B, H, T, D]
+            this_indexes = indexes[0].view(1, 1, T, 1)
+            this_indexes = this_indexes.expand(B, H, T, D)
+            self.cache[0].scatter_(2, this_indexes, k)
+            self.cache[1].scatter_(2, this_indexes, v)
         else:
             self.cache[0].index_copy_(2, indexes[0], k)
             self.cache[1].index_copy_(2, indexes[0], v)

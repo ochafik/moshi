@@ -433,8 +433,15 @@ class TTSService:
                 assert state is not None
                 assert state.k_cross is not None
                 assert state.v_cross is not None
-                state.k_cross.index_copy_(0, cross_indexes, k)
-                state.v_cross.index_copy_(0, cross_indexes, v)
+                # MPS-compatible: use scatter_ instead of index_copy_ to avoid CPU fallback
+                # See: https://github.com/Lightning-AI/litgpt/pull/1724
+                if k.device.type == "mps":
+                    idx = cross_indexes.view(-1, *([1] * (k.dim() - 1))).expand_as(k)
+                    state.k_cross.scatter_(0, idx, k)
+                    state.v_cross.scatter_(0, idx, v)
+                else:
+                    state.k_cross.index_copy_(0, cross_indexes, k)
+                    state.v_cross.index_copy_(0, cross_indexes, v)
 
         if need_reset:
             self.lm_gen.reset_streaming(reset_mask=reset_mask)
