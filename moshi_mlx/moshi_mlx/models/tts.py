@@ -196,8 +196,8 @@ class StateMachine:
             if state.entries:
                 entry = state.entries.popleft()
                 state.consumption_times.append(step)
+                consumed_new_word = True
                 if entry.tokens:
-                    consumed_new_word = True
                     state.transcript.append((entry.text, step))
                     # We queue the tokens to be fed to the model.
                     state.queued.extend(entry.tokens)
@@ -497,13 +497,9 @@ class TTSModel:
             **kwargs: passed to `moshi.models.lm.LMGen`.
         """
 
-        # TODO(laurent):
-        # Re-enable the padding bonus.
-        # def _main_wrapper(*args, **kwargs):
-        #     transformer_out, text_logits = original(*args, **kwargs)
-        #     if self.padding_bonus:
-        #         text_logits[..., self.machine.token_ids.pad] += self.padding_bonus
-        #     return transformer_out, text_logits
+        def _on_text_logits_hook(text_logits):
+            if self.padding_bonus:
+                text_logits[..., self.machine.token_ids.pad] += self.padding_bonus
 
         for c in self.lm.transformer_cache:
             c.reset()
@@ -567,9 +563,10 @@ class TTSModel:
                 K, _ = prefix.shape
                 assert K == self.lm.num_codebooks
                 text_prefixes.append(deque(prefix[0].tolist()))
-                delays = [
-                    d + self.delay_steps for d in self.lm.delays[self.lm.audio_offset :]
-                ]
+                # In MLX, self.lm.delays is already the audio delays (text delay stripped
+                # during config loading), so we don't need audio_offset here.
+                # PyTorch uses self.lm.delays[audio_offset:] because its delays include text.
+                delays = [d + self.delay_steps for d in self.lm.delays]
                 delayed = _delayed(
                     prefix[self.lm.audio_offset :],
                     delays,
@@ -616,6 +613,7 @@ class TTSModel:
             audio_sampler=Sampler(temp=self.temp),
             batch_size=batch_size,
             cfg_coef=self.cfg_coef,
+            on_text_logits_hook=_on_text_logits_hook,
             on_text_hook=_on_text_hook,
             on_audio_hook=_on_audio_hook,
             # TODO(laurent):
@@ -625,6 +623,14 @@ class TTSModel:
 
         logged_text_tokens = [[] for _ in states]
         frames: list[mx.array] = []
+
+        # Prepare tokens to replace depformer output during delay period
+        # Shape: [batch_size, dep_q] - all zeros
+        no_depformer_tokens = mx.full(
+            (len(all_entries), self.lm.dep_q),
+            self.machine.token_ids.zero,
+            dtype=mx.int32,
+        )
 
         for offset in range(self.max_gen_length):
             if all(state.end_step is not None for state in states):
@@ -636,10 +642,17 @@ class TTSModel:
                 mx.ones((len(states), missing), dtype=mx.int64)
                 * self.machine.token_ids.zero
             )
-            lm_gen.step(input_tokens, ct=ct, cross_attention_src=cross_attention_src)
+            # Since the audio is delayed by delay_steps, in these first steps
+            # we don't need to run the depformer since the audio stream should be
+            # all token_ids.zero
+            depformer_replace_tokens = no_depformer_tokens if offset < self.delay_steps else None
+            lm_gen.step(input_tokens, ct=ct, cross_attention_src=cross_attention_src,
+                       depformer_replace_tokens=depformer_replace_tokens)
             frame = lm_gen.last_audio_tokens()
 
-            if frame is not None and (frame != self.machine.token_ids.zero).all():
+            # Match PyTorch: collect all non-None frames, don't filter by zero content.
+            # The delay handling and frame removal happens at decode time, not here.
+            if frame is not None:
                 frames.append(mx.array(frame)[:, :, None])
 
                 if on_frame is not None:

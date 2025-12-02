@@ -463,8 +463,10 @@ class Lm(nn.Module):
         ct: ConditionTensor | None = None,
         cross_attention_src: None | mx.array = None,
         cfg_coef: float = 1.0,
+        on_text_logits_hook=None,
         on_text_hook=None,
         on_audio_hook=None,
+        depformer_replace_tokens: mx.array | None = None,
     ) -> tuple[mx.array, mx.array | None, mx.array]:
         xs = self.text_emb(text_token_ids)
         for token_ids, emb in zip(audio_token_ids, self.audio_embs):
@@ -485,17 +487,23 @@ class Lm(nn.Module):
         if cfg_coef != 1:
             l1, l2 = text_logits.split(2, axis=0)
             text_logits = cfg_coef * l1 - (cfg_coef - 1) * l2
+        if on_text_logits_hook is not None:
+            on_text_logits_hook(text_logits)
         text_token, _ = text_sampler(text_logits)
         if on_text_hook is not None:
             on_text_hook(text_token)
         if len(self.depformer.slices) > 0:
-            audio_tokens = self.depformer.sample(
-                transformer_out,
-                audio_sampler,
-                text_token,
-                self.depformer_cache,
-                cfg_coef=cfg_coef,
-            )
+            if depformer_replace_tokens is not None:
+                # Skip depformer and use provided tokens directly (e.g., during delay period)
+                audio_tokens = depformer_replace_tokens
+            else:
+                audio_tokens = self.depformer.sample(
+                    transformer_out,
+                    audio_sampler,
+                    text_token,
+                    self.depformer_cache,
+                    cfg_coef=cfg_coef,
+                )
             if on_audio_hook is not None:
                 on_audio_hook(audio_tokens)
         else:
