@@ -218,32 +218,6 @@ class TTSService:
 
         print("ready to roll.")
 
-    def _prime_codec(self, rounds: int = 1, reset_first: bool = True) -> None:
-        """
-        Prime the Mimi codec buffers to reduce cold-start artifacts.
-
-        This runs encode/decode cycles with low-intensity noise to fill
-        the streaming convolution buffers, reducing transient artifacts when
-        transitioning from silence to real audio (especially with quantized models).
-
-        Called at each new stream start (rounds=1) after reset.
-
-        Note: This adds ~80ms latency per round. We use rounds=1 as a tradeoff
-        between artifact reduction and latency.
-
-        Args:
-            rounds: Number of encode/decode cycles to run
-            reset_first: If True, reset the codec before priming (for clean start)
-        """
-        if reset_first:
-            self.mimi.reset_all()
-        for _ in range(rounds):
-            pcm = mx.zeros((1, 1, 1920))
-            mx.eval(self.mimi.encode(pcm))
-            # Decode with zero codes to also prime the decoder
-            codes = mx.zeros((1, self.n_q, 1), dtype=mx.int32)
-            mx.eval(self.mimi.decode(codes))
-
     def _get_cross_attention_source(self, attr: ConditionAttributes) -> mx.array:
         """
         Extract cross-attention embedding from voice attributes.
@@ -382,7 +356,7 @@ class TTSService:
                 # 5. Set up voice conditioning
                 # -------------------------------------------------------------
                 client.reset(machine)
-                self._prime_codec(rounds=1)  # Resets Mimi and primes with noise
+                self.mimi.reset_all()
                 for c in self.lm.transformer_cache:
                     c.reset()
                 for c in self.lm.depformer_cache:
