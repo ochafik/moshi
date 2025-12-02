@@ -264,6 +264,11 @@ def main():
             # We are processing frames one by one, although we could group them to improve speed.
             _pcm = tts_model.mimi.decode_step(frame)
             wav_frames.append(_pcm)
+        # Remove first 2 frames to avoid click/noise at the beginning.
+        # This matches the PyTorch implementation's handling of initial audio artifacts.
+        # See: moshi/moshi/models/tts.py simple_generate() for reference.
+        if len(wav_frames) > 2:
+            wav_frames = wav_frames[2:]
         wavs = mx.concat(wav_frames, axis=-1)
         effective_duration = 0.0
         for idx, request in enumerate(batch):
