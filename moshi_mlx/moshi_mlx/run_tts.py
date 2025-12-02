@@ -260,7 +260,11 @@ def main():
         )
 
         wav_frames = []
-        for frame in result.frames:
+        # Skip first delay_steps frames - they contain garbage audio because the
+        # audio stream hasn't started yet during the delay period.
+        # This matches PyTorch: tts_result.frames[self.delay_steps:]
+        frames_to_decode = result.frames[tts_model.delay_steps:]
+        for frame in frames_to_decode:
             # We are processing frames one by one, although we could group them to improve speed.
             _pcm = tts_model.mimi.decode_step(frame)
             wav_frames.append(_pcm)
