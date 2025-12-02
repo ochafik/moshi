@@ -234,25 +234,22 @@ class TTSService:
         # Set UNMUTE_TTS_WARMUP_ZEROS=1 to use original zero-only warmup.
         # =================================================================
         self.use_noise_priming = os.environ.get("UNMUTE_TTS_WARMUP_ZEROS", "0") != "1"
-        warmup_type = "noise" if self.use_noise_priming else "zeros"
-        print(f"warming up ({warmup_type}).")
-        self._prime_codec()
+        # Note: We don't prime at startup anymore - each stream resets and primes
+        # its own codec state via _prime_codec(rounds=1) at stream start.
         print("ready to roll.")
 
-    def _prime_codec(self, rounds: int = 3, reset_first: bool = True) -> None:
+    def _prime_codec(self, rounds: int = 1, reset_first: bool = True) -> None:
         """
         Prime the Mimi codec buffers to reduce cold-start artifacts.
 
-        This runs a few encode/decode cycles with low-intensity noise to fill
+        This runs encode/decode cycles with low-intensity noise to fill
         the streaming convolution buffers, reducing transient artifacts when
         transitioning from silence to real audio (especially with quantized models).
 
-        CALLED:
-        - At service startup (rounds=3)
-        - At each new stream start (rounds=1)
+        Called at each new stream start (rounds=1) after reset.
 
-        REVIEW: This adds ~80ms latency per round. For stream transitions,
-        we use rounds=1 as a tradeoff between artifact reduction and latency.
+        Note: This adds ~80ms latency per round. We use rounds=1 as a tradeoff
+        between artifact reduction and latency.
 
         Args:
             rounds: Number of encode/decode cycles to run
