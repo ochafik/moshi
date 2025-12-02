@@ -625,9 +625,9 @@ class TTSModel:
         frames: list[mx.array] = []
 
         # Prepare tokens to replace depformer output during delay period
-        # Shape: [batch_size, dep_q] - all zeros
+        # Shape: [batch_size, dep_q, 1] to match depformer output shape
         no_depformer_tokens = mx.full(
-            (len(all_entries), self.lm.dep_q),
+            (len(all_entries), self.lm.dep_q, 1),
             self.machine.token_ids.zero,
             dtype=mx.int32,
         )

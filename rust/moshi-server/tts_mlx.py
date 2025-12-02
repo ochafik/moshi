@@ -198,8 +198,7 @@ class TTSService:
     flags_out: np.ndarray | None = None
     clients: list[ClientState] = field(default_factory=list)
     cross_attention_cache: dict[str, mx.array] = field(default_factory=dict)
-    use_noise_priming: bool = True  # Set in __post_init__
-
+    
     def __post_init__(self):
         """Initialize client states and warm up the codec."""
         machine = self.tts_model.machine
@@ -217,25 +216,6 @@ class TTSService:
             for name, attributes in self.all_attributes.items():
                 self.cross_attention_cache[name] = self._get_cross_attention_source(attributes)
 
-        # =================================================================
-        # WARMUP: Prime the streaming codec buffers
-        # =================================================================
-        # The Mimi codec uses streaming causal convolutions that maintain
-        # internal state. When these buffers are all zeros (after reset),
-        # the first few frames can have transient artifacts.
-        #
-        # We "prime" the buffers by running a few encode/decode cycles with
-        # low-intensity noise. This fills the buffers with realistic signal
-        # statistics, reducing artifacts when real audio generation starts.
-        #
-        # The noise amplitude (0.001) is -60dB, essentially inaudible, but
-        # enough to populate the convolution buffers with non-zero values.
-        #
-        # Set UNMUTE_TTS_WARMUP_ZEROS=1 to use original zero-only warmup.
-        # =================================================================
-        self.use_noise_priming = os.environ.get("UNMUTE_TTS_WARMUP_ZEROS", "0") != "1"
-        # Note: We don't prime at startup anymore - each stream resets and primes
-        # its own codec state via _prime_codec(rounds=1) at stream start.
         print("ready to roll.")
 
     def _prime_codec(self, rounds: int = 1, reset_first: bool = True) -> None:
@@ -258,12 +238,7 @@ class TTSService:
         if reset_first:
             self.mimi.reset_all()
         for _ in range(rounds):
-            if self.use_noise_priming:
-                # Low-intensity noise (-60dB) helps prime streaming convolution buffers
-                # Shape: [batch=1, channels=1, samples=1920] (one 80ms frame at 24kHz)
-                pcm = mx.random.normal((1, 1, 1920)) * 0.001
-            else:
-                pcm = mx.zeros((1, 1, 1920))
+            pcm = mx.zeros((1, 1, 1920))
             mx.eval(self.mimi.encode(pcm))
             # Decode with zero codes to also prime the decoder
             codes = mx.zeros((1, self.n_q, 1), dtype=mx.int32)
@@ -321,6 +296,18 @@ class TTSService:
             # Replace sampled tokens with forced tokens
             text_tokens[:] = mx.array(out_tokens, dtype=mx.int64)[:, None]
 
+        def on_audio_hook(audio_tokens):
+            # Zero out audio tokens for codebooks still within their delay period.
+            # Different codebooks have different delays (typically 0, 1, 2, 3...),
+            # so this zeroes them individually until their delay + delay_steps passes.
+            delays = self.lm.delays
+            delay_steps = self.tts_model.delay_steps
+            machine = self.tts_model.machine
+            for q in range(audio_tokens.shape[1]):
+                delay = delays[q]
+                if client.offset < delay + delay_steps:
+                    audio_tokens[:, q] = machine.token_ids.zero
+
         return LmGen(
             self.lm,
             max_steps=30000,  # ~40 minutes of audio at 12.5Hz
@@ -329,6 +316,7 @@ class TTSService:
             batch_size=1,  # REVIEW: Always 1, even if TTSService.batch_size > 1
             cfg_coef=self.tts_model.cfg_coef,
             on_text_hook=on_text_hook,
+            on_audio_hook=on_audio_hook,
         )
 
     def _print(self, *args, **kwargs):
@@ -480,10 +468,24 @@ class TTSService:
             missing = self.lm.n_q - self.lm.dep_q
             input_tokens = mx.full((1, missing), machine.token_ids.zero, dtype=mx.int64)
 
+            # During the delay period, bypass depformer by replacing its output
+            # with zeros. This prevents garbage audio from being generated
+            # when the model hasn't fully warmed up yet.
+            # Matches PyTorch: depformer_replace_tokens during delay_steps
+            # Shape must be [batch, generated_codebooks, 1] to match depformer output
+            depformer_replace_tokens = None
+            if client.offset < delay_steps:
+                depformer_replace_tokens = mx.full(
+                    (1, self.lm.dep_q, 1),
+                    machine.token_ids.zero,
+                    dtype=mx.int32,
+                )
+
             client.lm_gen.step(
                 input_tokens,
                 ct=client.ct,
                 cross_attention_src=client.cross_attention_src,
+                depformer_replace_tokens=depformer_replace_tokens,
             )
 
             # -----------------------------------------------------------------
