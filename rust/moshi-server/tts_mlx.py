@@ -23,8 +23,7 @@
 # 1. [BATCH] batch_size>1 is untested - MLX is single-threaded so no benefit
 # 2. [CACHE] LM caches are shared across all clients - may cause issues
 # 3. [QUANT] Quantization applied selectively (depformer, attn, gating only)
-# 4. [PRIME] Codec priming adds ~80ms latency per stream start
-# 5. [MEMORY] No explicit memory cleanup - relies on Python GC
+# 4. [MEMORY] No explicit memory cleanup - relies on Python GC
 #
 # =============================================================================
 
