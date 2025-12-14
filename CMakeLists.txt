@@ -37,7 +37,7 @@ set_target_properties(moshi_stt PROPERTIES
 
 # Mimi decode tool
 add_executable(mimi_decode tools/mimi_decode.cpp)
-target_link_libraries(mimi_decode ggml-base)
+target_link_libraries(mimi_decode ggml-base ggml-cpu)
 set_target_properties(mimi_decode PROPERTIES
     BUILD_RPATH "${LLAMA_BUILD_DIR}/bin"
     INSTALL_RPATH "${LLAMA_BUILD_DIR}/bin"

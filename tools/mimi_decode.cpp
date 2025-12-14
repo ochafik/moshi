@@ -14,6 +14,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "ggml-alloc.h"
 #include "gguf.h"
 
@@ -50,6 +51,9 @@ struct mimi_model {
     std::vector<struct ggml_tensor *> rvq_rest_cluster_usage;   // 7 x [codebook_size]
     struct ggml_tensor * rvq_rest_input_proj;   // [codebook_dim, d_model]
     struct ggml_tensor * rvq_rest_output_proj;  // [d_model, codebook_dim]
+
+    // Top-level upsample (2x before transformer)
+    struct ggml_tensor * upsample_w;  // [512, 4, 1] - transposed conv for 2x upsample
 
     // Decoder transformer (8 layers)
     struct layer {
@@ -91,31 +95,52 @@ struct mimi_model {
 
 // Simple JSON parsing for audio tokens
 static std::vector<std::vector<int32_t>> parse_audio_tokens(const std::string & json_path) {
+    fprintf(stderr, "  DEBUG: opening file...\n");
     std::ifstream f(json_path);
+    if (!f.good()) {
+        fprintf(stderr, "  ERROR: cannot open file\n");
+        return {};
+    }
     std::string content((std::istreambuf_iterator<char>(f)),
                          std::istreambuf_iterator<char>());
+    fprintf(stderr, "  DEBUG: file read, %zu bytes\n", content.size());
 
     std::vector<std::vector<int32_t>> tokens;
     size_t pos = content.find("\"audio_tokens\"");
-    if (pos == std::string::npos) return tokens;
+    if (pos == std::string::npos) {
+        fprintf(stderr, "  ERROR: audio_tokens not found\n");
+        return tokens;
+    }
+    fprintf(stderr, "  DEBUG: found audio_tokens at pos %zu\n", pos);
 
     pos = content.find('[', pos);
     if (pos == std::string::npos) return tokens;
 
+    int frame_count = 0;
+    int loop_count = 0;
     while (true) {
+        loop_count++;
+        if (loop_count > 1000) {
+            fprintf(stderr, "  ERROR: infinite loop detected at pos %zu\n", pos);
+            break;
+        }
+
         pos = content.find('[', pos + 1);
         if (pos == std::string::npos) break;
 
         size_t check = content.find(']', pos);
-        if (check != std::string::npos && content.find('[', pos + 1) > check) {
+        size_t next_open = content.find('[', pos + 1);
+        fprintf(stderr, "    loop %d: pos=%zu, check=%zu, next_open=%zu\n", loop_count, pos, check, next_open);
+        if (check != std::string::npos && next_open > check) {
             std::vector<int32_t> frame;
             size_t end = content.find(']', pos);
             std::string frame_str = content.substr(pos + 1, end - pos - 1);
+            fprintf(stderr, "      parsing frame: '%s'\n", frame_str.c_str());
 
             size_t num_start = 0;
             while (num_start < frame_str.size()) {
                 while (num_start < frame_str.size() &&
-                       (frame_str[num_start] == ' ' || frame_str[num_start] == ',')) {
+                       (frame_str[num_start] == ' ' || frame_str[num_start] == ',' || frame_str[num_start] == '\n')) {
                     num_start++;
                 }
                 if (num_start >= frame_str.size()) break;
@@ -131,19 +156,24 @@ static std::vector<std::vector<int32_t>> parse_audio_tokens(const std::string & 
                 num_start = num_end;
             }
 
+            fprintf(stderr, "      frame has %zu values\n", frame.size());
             if (frame.size() == 8) {
                 tokens.push_back(frame);
+                frame_count++;
             }
             pos = end;
         }
 
         size_t next_bracket = content.find('[', pos + 1);
         size_t end_array = content.find(']', pos + 1);
-        if (next_bracket == std::string::npos || (end_array < next_bracket)) {
+        fprintf(stderr, "    after frame: next_bracket=%zu, end_array=%zu\n", next_bracket, end_array);
+        if (next_bracket == std::string::npos || (end_array != std::string::npos && end_array < next_bracket)) {
+            fprintf(stderr, "    breaking loop\n");
             break;
         }
     }
 
+    fprintf(stderr, "  DEBUG: parsed %d frames\n", frame_count);
     return tokens;
 }
 
@@ -245,6 +275,7 @@ static bool load_model(mimi_model & model, const std::string & path) {
     printf("  d_model: %d\n", model.hparams.d_model);
     printf("  n_layers: %d\n", model.hparams.n_layers);
     printf("  n_heads: %d\n", model.hparams.n_heads);
+    printf("  dim_feedforward: %d\n", model.hparams.dim_feedforward);
     printf("  sample_rate: %d\n", model.hparams.sample_rate);
     printf("  frame_rate: %.1f\n", model.hparams.frame_rate);
 
@@ -288,6 +319,9 @@ static bool load_model(mimi_model & model, const std::string & path) {
         snprintf(buf, sizeof(buf), "quantizer.rvq_rest.vq.layers.%d.codebook.cluster_usage.weight", i);
         model.rvq_rest_cluster_usage[i] = get_tensor(buf);
     }
+
+    // Top-level upsample (2x before transformer)
+    model.upsample_w = get_tensor("upsample.convtr.convtr.convtr.weight");
 
     // Transformer layers
     model.layers.resize(model.hparams.n_layers);
@@ -422,25 +456,32 @@ static void softmax(float * x, int n) {
 }
 
 // Transposed 1D convolution (upsampling)
+// trim_end: number of samples to remove from the end (like unpad1d(y, (0, trim_end)))
 static void conv_transpose1d(
     std::vector<float> & out, const std::vector<float> & in,
     const float * weight, const float * bias,
-    int in_ch, int out_ch, int kernel, int stride, int seq_len
+    int in_ch, int out_ch, int kernel, int stride, int seq_len, int trim_end = 0
 ) {
-    int out_len = (seq_len - 1) * stride + kernel;
-    out.assign(out_ch * out_len, 0.0f);
+    // Full output length before trimming
+    int full_len = (seq_len - 1) * stride + kernel;
+    // Final output length after trimming from the end only
+    int out_len = full_len - trim_end;
 
-    // Add bias
+    // Work in full buffer first, then trim
+    std::vector<float> full_out(out_ch * full_len, 0.0f);
+
+    // Add bias to full buffer
     if (bias) {
         for (int oc = 0; oc < out_ch; oc++) {
-            for (int t = 0; t < out_len; t++) {
-                out[oc * out_len + t] = bias[oc];
+            for (int t = 0; t < full_len; t++) {
+                full_out[oc * full_len + t] = bias[oc];
             }
         }
     }
 
     // Scatter-add
-    // Weight shape from GGUF: [in_ch, kernel, out_ch]
+    // GGUF weight shape: [in_ch, kernel, out_ch] with ggml column-major layout
+    // To access w[ic][k][oc]: index = ic + k * in_ch + oc * in_ch * kernel
     for (int ic = 0; ic < in_ch; ic++) {
         for (int t = 0; t < seq_len; t++) {
             float in_val = in[ic * seq_len + t];
@@ -448,10 +489,18 @@ static void conv_transpose1d(
 
             for (int k = 0; k < kernel; k++) {
                 for (int oc = 0; oc < out_ch; oc++) {
-                    int w_idx = ic * kernel * out_ch + k * out_ch + oc;
-                    out[oc * out_len + t_out + k] += in_val * weight[w_idx];
+                    int w_idx = ic + k * in_ch + oc * in_ch * kernel;
+                    full_out[oc * full_len + t_out + k] += in_val * weight[w_idx];
                 }
             }
+        }
+    }
+
+    // Extract from start, trimming from the end only
+    out.resize(out_ch * out_len);
+    for (int oc = 0; oc < out_ch; oc++) {
+        for (int t = 0; t < out_len; t++) {
+            out[oc * out_len + t] = full_out[oc * full_len + t];
         }
     }
 }
@@ -466,7 +515,8 @@ static void conv1d(
     int out_len = seq_len;  // Same length output with causal padding
     out.assign(out_ch * out_len, 0.0f);
 
-    // Weight shape from GGUF: [in_ch, kernel, out_ch]
+    // GGUF weight shape: [in_ch, kernel, out_ch] with ggml column-major layout
+    // To access w[ic][k][oc]: index = ic + k * in_ch + oc * in_ch * kernel
     for (int oc = 0; oc < out_ch; oc++) {
         for (int t = 0; t < out_len; t++) {
             float sum = bias ? bias[oc] : 0.0f;
@@ -475,7 +525,7 @@ static void conv1d(
                 for (int k = 0; k < kernel; k++) {
                     int t_in = t - pad + k * dilation;
                     if (t_in >= 0 && t_in < seq_len) {
-                        int w_idx = ic * kernel * out_ch + k * out_ch + oc;
+                        int w_idx = ic + k * in_ch + oc * in_ch * kernel;
                         sum += in[ic * seq_len + t_in] * weight[w_idx];
                     }
                 }
@@ -501,7 +551,7 @@ static std::vector<float> decode(mimi_model & model, const std::vector<std::vect
     fflush(stdout);
 
     // Step 1: Quantizer decode - lookup embeddings and sum
-    // The quantizer uses embedding = embedding_sum / cluster_usage
+    // IMPORTANT: The output_proj is applied ONCE after summing embeddings, not per-codebook
     // Output: [d_model, T]
     std::vector<float> x(hp.d_model * T, 0.0f);
 
@@ -511,109 +561,462 @@ static std::vector<float> decode(mimi_model & model, const std::vector<std::vect
     }
 
     // Helper to compute embedding from embedding_sum / cluster_usage
+    // Note: epsilon=1e-5 matches Python's EuclideanCodebook
     auto get_embedding = [&](const float * emb_sum, const float * usage, int code, std::vector<float> & out) {
         if (code < 0 || code >= hp.codebook_size) code = 0;
         float u = usage[code];
-        if (u < 1.0f) u = 1.0f;  // Avoid division by zero
+        if (u < 1e-5f) u = 1e-5f;  // Match Python epsilon
 
         out.resize(hp.codebook_dim);
-        // embedding_sum shape: [codebook_dim, codebook_size]
+        // Data layout: [codebook_size, codebook_dim] = [2048, 256]
         for (int d = 0; d < hp.codebook_dim; d++) {
-            out[d] = emb_sum[d * hp.codebook_size + code] / u;
+            out[d] = emb_sum[code * hp.codebook_dim + d] / u;
         }
     };
 
-    // First codebook
+    // Helper to apply output projection: Conv1d(256, 512, kernel=1)
+    // PyTorch weight: [out, in, kernel] = [512, 256, 1], index: w[d * 256 + k]
+    auto apply_out_proj = [&](const float * proj, const std::vector<float> & in, std::vector<float> & out) {
+        out.resize(hp.d_model);
+        for (int d = 0; d < hp.d_model; d++) {
+            float sum = 0.0f;
+            for (int k = 0; k < hp.codebook_dim; k++) {
+                sum += proj[d * hp.codebook_dim + k] * in[k];
+            }
+            out[d] = sum;
+        }
+    };
+
     const float * first_emb_sum = (const float *)model.rvq_first_embedding_sum->data;
     const float * first_usage = (const float *)model.rvq_first_cluster_usage->data;
     const float * first_out_proj = model.rvq_first_output_proj ? (const float *)model.rvq_first_output_proj->data : nullptr;
-
-    std::vector<float> emb(hp.codebook_dim);
-    for (int t = 0; t < T; t++) {
-        int code = tokens[t][0];
-        get_embedding(first_emb_sum, first_usage, code, emb);
-
-        // Project through output_proj: [d_model, codebook_dim] @ [codebook_dim] -> [d_model]
-        if (first_out_proj) {
-            for (int d = 0; d < hp.d_model; d++) {
-                float sum = 0.0f;
-                for (int k = 0; k < hp.codebook_dim; k++) {
-                    sum += first_out_proj[d * hp.codebook_dim + k] * emb[k];
-                }
-                x[d * T + t] += sum;
-            }
-        } else {
-            for (int d = 0; d < hp.codebook_dim && d < hp.d_model; d++) {
-                x[d * T + t] += emb[d];
-            }
-        }
-    }
-
-    // Rest codebooks (indices 1-7, using rvq_rest.vq.layers.0-6)
     const float * rest_out_proj = model.rvq_rest_output_proj ? (const float *)model.rvq_rest_output_proj->data : nullptr;
 
-    for (int q = 1; q < hp.n_codebooks; q++) {
-        int layer_idx = q - 1;  // layers 0-6 for codebooks 1-7
-        if (layer_idx >= (int)model.rvq_rest_embedding_sum.size()) {
-            fprintf(stderr, "Warning: missing codebook %d\n", q);
-            continue;
+    std::vector<float> emb(hp.codebook_dim);
+    std::vector<float> emb_sum_first(hp.codebook_dim);
+    std::vector<float> emb_sum_rest(hp.codebook_dim);
+    std::vector<float> proj_first(hp.d_model);
+    std::vector<float> proj_rest(hp.d_model);
+
+    for (int t = 0; t < T; t++) {
+        // First codebook (rvq_first): 1 codebook, apply output_proj once
+        std::fill(emb_sum_first.begin(), emb_sum_first.end(), 0.0f);
+        get_embedding(first_emb_sum, first_usage, tokens[t][0], emb);
+        for (int d = 0; d < hp.codebook_dim; d++) {
+            emb_sum_first[d] += emb[d];
         }
 
-        if (!model.rvq_rest_embedding_sum[layer_idx] || !model.rvq_rest_cluster_usage[layer_idx]) {
-            fprintf(stderr, "Warning: codebook %d weights not loaded\n", q);
-            continue;
+        // Apply output projection for rvq_first
+        if (first_out_proj) {
+            apply_out_proj(first_out_proj, emb_sum_first, proj_first);
+        } else {
+            proj_first = emb_sum_first;
+            proj_first.resize(hp.d_model, 0.0f);
         }
 
-        const float * rest_emb_sum = (const float *)model.rvq_rest_embedding_sum[layer_idx]->data;
-        const float * rest_usage = (const float *)model.rvq_rest_cluster_usage[layer_idx]->data;
+        // Rest codebooks (rvq_rest): 7 codebooks, sum embeddings first, then apply output_proj once
+        std::fill(emb_sum_rest.begin(), emb_sum_rest.end(), 0.0f);
+        for (int q = 1; q < hp.n_codebooks; q++) {
+            int layer_idx = q - 1;
+            if (layer_idx >= (int)model.rvq_rest_embedding_sum.size()) continue;
+            if (!model.rvq_rest_embedding_sum[layer_idx]) continue;
 
-        for (int t = 0; t < T; t++) {
-            int code = tokens[t][q];
-            get_embedding(rest_emb_sum, rest_usage, code, emb);
+            const float * rest_emb_sum = (const float *)model.rvq_rest_embedding_sum[layer_idx]->data;
+            const float * rest_usage = (const float *)model.rvq_rest_cluster_usage[layer_idx]->data;
 
-            if (rest_out_proj) {
-                for (int d = 0; d < hp.d_model; d++) {
-                    float sum = 0.0f;
-                    for (int k = 0; k < hp.codebook_dim; k++) {
-                        sum += rest_out_proj[d * hp.codebook_dim + k] * emb[k];
-                    }
-                    x[d * T + t] += sum;
-                }
-            } else {
-                for (int d = 0; d < hp.codebook_dim && d < hp.d_model; d++) {
-                    x[d * T + t] += emb[d];
-                }
+            get_embedding(rest_emb_sum, rest_usage, tokens[t][q], emb);
+            for (int d = 0; d < hp.codebook_dim; d++) {
+                emb_sum_rest[d] += emb[d];
             }
         }
+
+        // Apply output projection for rvq_rest
+        if (rest_out_proj) {
+            apply_out_proj(rest_out_proj, emb_sum_rest, proj_rest);
+        } else {
+            proj_rest = emb_sum_rest;
+            proj_rest.resize(hp.d_model, 0.0f);
+        }
+
+        // Sum both contributions
+        for (int d = 0; d < hp.d_model; d++) {
+            x[d * T + t] = proj_first[d] + proj_rest[d];
+        }
+
     }
 
     printf("  Quantizer decode done, x shape: [%d, %d]\n", hp.d_model, T);
+    printf("  Quantizer output range: [");
+    float qmin = x[0], qmax = x[0];
+    for (size_t i = 0; i < x.size(); i++) {
+        if (x[i] < qmin) qmin = x[i];
+        if (x[i] > qmax) qmax = x[i];
+    }
+    printf("%.6f, %.6f]\n", qmin, qmax);
+    printf("  First 8 values at t=0: ");
+    for (int d = 0; d < 8 && d < hp.d_model; d++) {
+        printf("%.6f ", x[d * T + 0]);
+    }
+    printf("\n");
     fflush(stdout);
 
-    // Step 2: Decoder transformer
-    // For simplicity, skip transformer for now (it refines the embeddings)
-    // In a full implementation, we'd run 8 layers of attention + FFN
-    printf("  Skipping transformer (simplified decode)...\n");
+    // Step 2: Apply 2x upsample before transformer
+    // This is a depthwise transposed conv with kernel=4, stride=2
+    // Input: [d_model, T], Output: [d_model, T*2]
+    int T_up = T * 2;  // Output length after 2x upsample
+    if (model.upsample_w) {
+        printf("  Applying 2x upsample: [%d, %d] -> [%d, %d]\n", hp.d_model, T, hp.d_model, T_up);
+        fflush(stdout);
 
-    // Step 3: SEANet decoder
-    // init_conv: [d_model, T] -> [1024, T]
+        // upsample_w GGUF shape: [512, 4, 1] with ggml dimension order
+        // In ggml: ne[0]=512, ne[1]=4, ne[2]=1
+        // Access: w[c + k * d_model] for channel c, kernel position k
+        const float * w = (const float *)model.upsample_w->data;
+        const int kernel = 4;
+        const int stride = 2;
+
+        std::vector<float> x_up(hp.d_model * T_up, 0.0f);
+
+        // Depthwise transposed conv: each channel processed independently
+        // out[c, t_out] = sum_k(w[c, k] * in[c, t_in]) where t_in = (t_out - k) / stride
+        for (int c = 0; c < hp.d_model; c++) {
+            for (int t_in = 0; t_in < T; t_in++) {
+                float val = x[c * T + t_in];
+                for (int k = 0; k < kernel; k++) {
+                    int t_out = t_in * stride + k;
+                    if (t_out >= 0 && t_out < T_up) {
+                        // Note: ggml stores as [d_model, kernel], access w[c + k * d_model]
+                        x_up[c * T_up + t_out] += val * w[c + k * hp.d_model];
+                    }
+                }
+            }
+        }
+        x = std::move(x_up);
+
+        printf("  Upsample output range: [");
+        float umin = x[0], umax = x[0];
+        for (size_t i = 0; i < x.size(); i++) {
+            if (x[i] < umin) umin = x[i];
+            if (x[i] > umax) umax = x[i];
+        }
+        printf("%.6f, %.6f]\n", umin, umax);
+        printf("  First 8 upsample values at t=0: ");
+        for (int d = 0; d < 8 && d < hp.d_model; d++) {
+            printf("%.6f ", x[d * T_up + 0]);
+        }
+        printf("\n");
+        fflush(stdout);
+    } else {
+        printf("  Warning: upsample weights not found, skipping upsample\n");
+        T_up = T;
+    }
+
+    // Step 3: Decoder transformer (8 layers) using ggml computation graph
+    // Use ggml_backend for proper multi-context handling
+    bool skip_transformer = getenv("SKIP_TRANSFORMER") != nullptr;
+    int n_tokens_final = T_up;  // Will be used for SEANet
+
+    if (skip_transformer) {
+        printf("  SKIPPING decoder transformer (SKIP_TRANSFORMER set)\n");
+        fflush(stdout);
+    } else {
+    printf("  Running decoder transformer (%d layers) with ggml backend...\n", hp.n_layers);
+    fflush(stdout);
+
+    const int64_t n_embd = hp.d_model;
+    const int64_t n_head = hp.n_heads;
+    const int64_t n_tokens = T_up;  // Use upsampled token count
+    const int64_t n_embd_head = n_embd / n_head;
+
+    printf("  DEBUG: n_embd=%lld, n_head=%lld, n_tokens=%lld, n_embd_head=%lld\n",
+           (long long)n_embd, (long long)n_head, (long long)n_tokens, (long long)n_embd_head);
+    fflush(stdout);
+
+    // Transpose input: x is [d_model, T_up], we work with [n_embd, n_tokens]
+    std::vector<float> x_transposed(n_tokens * n_embd);
+    for (int64_t t = 0; t < n_tokens; t++) {
+        for (int d = 0; d < hp.d_model; d++) {
+            x_transposed[t * n_embd + d] = x[d * n_tokens + t];
+        }
+    }
+
+    // Initialize CPU backend
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    if (!backend) {
+        fprintf(stderr, "Error: failed to create CPU backend\n");
+        return {};
+    }
+    printf("  CPU backend initialized\n");
+    fflush(stdout);
+
+    for (int il = 0; il < hp.n_layers; il++) {
+        auto & L = model.layers[il];
+
+        if (!L.norm1_w || !L.attn_in_proj || !L.attn_out_proj ||
+            !L.norm2_w || !L.ffn_linear1 || !L.ffn_linear2) {
+            printf("    Layer %d: missing weights, skipping\n", il);
+            continue;
+        }
+
+
+        // Create context for graph structure only (no tensor data allocation)
+        size_t ctx_size = ggml_tensor_overhead() * 256 + ggml_graph_overhead();
+        struct ggml_init_params ctx_params = {
+            .mem_size   = ctx_size,
+            .mem_buffer = nullptr,
+            .no_alloc   = true,  // Don't allocate tensor data, just structure
+        };
+        struct ggml_context * ctx = ggml_init(ctx_params);
+        if (!ctx) {
+            fprintf(stderr, "Error: failed to create context for layer %d\n", il);
+            ggml_backend_free(backend);
+            return {};
+        }
+
+        // Create input tensor (will be allocated by backend)
+        struct ggml_tensor * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(inp, "input");
+        ggml_set_input(inp);
+
+        // Create position tensor for RoPE
+        struct ggml_tensor * inp_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_tokens);
+        ggml_set_name(inp_pos, "pos");
+        ggml_set_input(inp_pos);
+
+        struct ggml_tensor * cur = inp;  // cur will be reassigned through graph
+        struct ggml_tensor * inpSA = cur;
+
+        // === Self-attention ===
+        // Create all weight tensors in compute context
+        struct ggml_tensor * w_norm1 = ggml_dup_tensor(ctx, L.norm1_w);
+        struct ggml_tensor * w_in_proj = ggml_dup_tensor(ctx, L.attn_in_proj);
+        struct ggml_tensor * w_out_proj = ggml_dup_tensor(ctx, L.attn_out_proj);
+        struct ggml_tensor * w_norm2 = ggml_dup_tensor(ctx, L.norm2_w);
+        struct ggml_tensor * w_ffn1 = ggml_dup_tensor(ctx, L.ffn_linear1);
+        struct ggml_tensor * w_ffn2 = ggml_dup_tensor(ctx, L.ffn_linear2);
+
+        // Optional tensors (biases, layer scales)
+        struct ggml_tensor * b_norm1 = L.norm1_b ? ggml_dup_tensor(ctx, L.norm1_b) : nullptr;
+        struct ggml_tensor * b_norm2 = L.norm2_b ? ggml_dup_tensor(ctx, L.norm2_b) : nullptr;
+        struct ggml_tensor * w_scale1 = L.layer_scale_1 ? ggml_dup_tensor(ctx, L.layer_scale_1) : nullptr;
+        struct ggml_tensor * w_scale2 = L.layer_scale_2 ? ggml_dup_tensor(ctx, L.layer_scale_2) : nullptr;
+
+        // Mark as inputs
+        ggml_set_input(w_norm1);
+        ggml_set_input(w_in_proj);
+        ggml_set_input(w_out_proj);
+        ggml_set_input(w_norm2);
+        ggml_set_input(w_ffn1);
+        ggml_set_input(w_ffn2);
+        if (b_norm1) ggml_set_input(b_norm1);
+        if (b_norm2) ggml_set_input(b_norm2);
+        if (w_scale1) ggml_set_input(w_scale1);
+        if (w_scale2) ggml_set_input(w_scale2);
+
+        // LayerNorm1
+        struct ggml_tensor * norm1 = ggml_norm(ctx, cur, 1e-5f);
+        norm1 = ggml_mul(ctx, norm1, w_norm1);
+        if (b_norm1) {
+            norm1 = ggml_add(ctx, norm1, b_norm1);
+        }
+
+        // QKV projection
+        struct ggml_tensor * qkv = ggml_mul_mat(ctx, w_in_proj, norm1);
+
+        // Split Q, K, V - use cont to make them contiguous
+        struct ggml_tensor * Qcur = ggml_cont(ctx, ggml_view_2d(ctx, qkv, n_embd, n_tokens, qkv->nb[1], 0));
+        struct ggml_tensor * Kcur = ggml_cont(ctx, ggml_view_2d(ctx, qkv, n_embd, n_tokens, qkv->nb[1], n_embd * sizeof(float)));
+        struct ggml_tensor * Vcur = ggml_cont(ctx, ggml_view_2d(ctx, qkv, n_embd, n_tokens, qkv->nb[1], 2 * n_embd * sizeof(float)));
+
+        // Reshape for multi-head
+        Qcur = ggml_reshape_3d(ctx, Qcur, n_embd_head, n_head, n_tokens);
+        Kcur = ggml_reshape_3d(ctx, Kcur, n_embd_head, n_head, n_tokens);
+        Vcur = ggml_reshape_3d(ctx, Vcur, n_embd_head, n_head, n_tokens);
+
+        // Apply RoPE
+        Qcur = ggml_rope_ext(ctx, Qcur, inp_pos, nullptr,
+                n_embd_head, GGML_ROPE_TYPE_NORMAL, 0, 10000.0f, 1.0f,
+                0.0f, 1.0f, 0.0f, 0.0f);
+        Kcur = ggml_rope_ext(ctx, Kcur, inp_pos, nullptr,
+                n_embd_head, GGML_ROPE_TYPE_NORMAL, 0, 10000.0f, 1.0f,
+                0.0f, 1.0f, 0.0f, 0.0f);
+
+        // Permute for attention: [head_dim, n_head, n_tokens] -> [head_dim, n_tokens, n_head]
+        struct ggml_tensor * q = ggml_permute(ctx, Qcur, 0, 2, 1, 3);
+        struct ggml_tensor * k = ggml_permute(ctx, Kcur, 0, 2, 1, 3);
+        struct ggml_tensor * v = ggml_permute(ctx, Vcur, 0, 2, 1, 3);
+
+        // Compute attention: K @ Q^T
+        struct ggml_tensor * kq = ggml_mul_mat(ctx, k, q);
+
+        // Scale and softmax
+        float kq_scale = 1.0f / sqrtf((float)n_embd_head);
+        kq = ggml_soft_max_ext(ctx, kq, nullptr, kq_scale, 0.0f);
+
+        // Attention output: softmax @ V (transpose V for correct dimensions)
+        struct ggml_tensor * v_t = ggml_cont(ctx, ggml_transpose(ctx, v));
+        struct ggml_tensor * attn = ggml_mul_mat(ctx, v_t, kq);
+
+        // Permute back and reshape
+        attn = ggml_permute(ctx, attn, 0, 2, 1, 3);
+        attn = ggml_cont_2d(ctx, attn, n_embd, n_tokens);
+
+        // Output projection
+        struct ggml_tensor * attn_out = ggml_mul_mat(ctx, w_out_proj, attn);
+
+        // Layer scale
+        if (w_scale1) {
+            attn_out = ggml_mul(ctx, attn_out, w_scale1);
+        }
+
+        // Residual
+        cur = ggml_add(ctx, attn_out, inpSA);
+
+        // === FFN ===
+        struct ggml_tensor * ffn_inp = cur;
+
+        // LayerNorm2
+        struct ggml_tensor * norm2 = ggml_norm(ctx, cur, 1e-5f);
+        norm2 = ggml_mul(ctx, norm2, w_norm2);
+        if (b_norm2) {
+            norm2 = ggml_add(ctx, norm2, b_norm2);
+        }
+
+        // FFN: up -> GELU -> down
+        struct ggml_tensor * ffn_hidden = ggml_mul_mat(ctx, w_ffn1, norm2);
+        ffn_hidden = ggml_gelu_erf(ctx, ffn_hidden);  // Use erf GELU to match PyTorch default
+        struct ggml_tensor * ffn_out = ggml_mul_mat(ctx, w_ffn2, ffn_hidden);
+
+        // Layer scale
+        if (w_scale2) {
+            ffn_out = ggml_mul(ctx, ffn_out, w_scale2);
+        }
+
+        // Residual
+        cur = ggml_add(ctx, ffn_out, ffn_inp);
+        ggml_set_name(cur, "output");
+        ggml_set_output(cur);
+
+        // Build graph
+        struct ggml_cgraph * gf = ggml_new_graph(ctx);
+        ggml_build_forward_expand(gf, cur);
+
+        // Allocate backend buffer for compute tensors
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+        if (!buf) {
+            fprintf(stderr, "Error: failed to allocate backend buffer for layer %d\n", il);
+            ggml_free(ctx);
+            ggml_backend_free(backend);
+            return {};
+        }
+
+        // Copy input data to the INPUT tensor (not cur, which has been reassigned)
+        ggml_backend_tensor_set(inp, x_transposed.data(), 0, n_tokens * n_embd * sizeof(float));
+
+        // Set position indices
+        std::vector<int32_t> positions(n_tokens);
+        for (int t = 0; t < n_tokens; t++) {
+            positions[t] = t;
+        }
+        ggml_backend_tensor_set(inp_pos, positions.data(), 0, n_tokens * sizeof(int32_t));
+
+        // Copy model weights to compute tensors
+        ggml_backend_tensor_set(w_norm1, L.norm1_w->data, 0, ggml_nbytes(L.norm1_w));
+        ggml_backend_tensor_set(w_in_proj, L.attn_in_proj->data, 0, ggml_nbytes(L.attn_in_proj));
+        ggml_backend_tensor_set(w_out_proj, L.attn_out_proj->data, 0, ggml_nbytes(L.attn_out_proj));
+        ggml_backend_tensor_set(w_norm2, L.norm2_w->data, 0, ggml_nbytes(L.norm2_w));
+        ggml_backend_tensor_set(w_ffn1, L.ffn_linear1->data, 0, ggml_nbytes(L.ffn_linear1));
+        ggml_backend_tensor_set(w_ffn2, L.ffn_linear2->data, 0, ggml_nbytes(L.ffn_linear2));
+
+        // Copy optional weights
+        if (b_norm1) ggml_backend_tensor_set(b_norm1, L.norm1_b->data, 0, ggml_nbytes(L.norm1_b));
+        if (b_norm2) ggml_backend_tensor_set(b_norm2, L.norm2_b->data, 0, ggml_nbytes(L.norm2_b));
+        if (w_scale1) ggml_backend_tensor_set(w_scale1, L.layer_scale_1->data, 0, ggml_nbytes(L.layer_scale_1));
+        if (w_scale2) ggml_backend_tensor_set(w_scale2, L.layer_scale_2->data, 0, ggml_nbytes(L.layer_scale_2));
+
+        // Compute
+        enum ggml_status status = ggml_backend_graph_compute(backend, gf);
+        if (status != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "Error: backend compute failed for layer %d, status=%d\n", il, (int)status);
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            ggml_backend_free(backend);
+            return {};
+        }
+
+        // Copy result back
+        ggml_backend_tensor_get(cur, x_transposed.data(), 0, n_tokens * n_embd * sizeof(float));
+
+        // Debug: print layer output
+        float lmin = x_transposed[0], lmax = x_transposed[0];
+        for (size_t i = 0; i < x_transposed.size(); i++) {
+            if (x_transposed[i] < lmin) lmin = x_transposed[i];
+            if (x_transposed[i] > lmax) lmax = x_transposed[i];
+        }
+        printf("  Layer %d: range [%.4f, %.4f], first 4 at t=0: %.4f %.4f %.4f %.4f\n",
+               il, lmin, lmax, x_transposed[0], x_transposed[1], x_transposed[2], x_transposed[3]);
+        fflush(stdout);
+
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+    }
+
+    ggml_backend_free(backend);
+
+    // Transpose back to [d_model, n_tokens]
+    x.resize(hp.d_model * n_tokens);
+    for (int64_t t = 0; t < n_tokens; t++) {
+        for (int d = 0; d < hp.d_model; d++) {
+            x[d * n_tokens + t] = x_transposed[t * n_embd + d];
+        }
+    }
+
+    printf("  Decoder transformer done\n");
+    printf("  Transformer output range: [");
+    float tmin = x[0], tmax = x[0];
+    for (size_t i = 0; i < x.size(); i++) {
+        if (x[i] < tmin) tmin = x[i];
+        if (x[i] > tmax) tmax = x[i];
+    }
+    printf("%.6f, %.6f]\n", tmin, tmax);
+    printf("  First 8 transformer values at t=0: ");
+    for (int d = 0; d < 8 && d < hp.d_model; d++) {
+        printf("%.6f ", x[d * n_tokens + 0]);
+    }
+    printf("\n");
+    fflush(stdout);
+
+    n_tokens_final = n_tokens;  // Update for SEANet
+    } // End else block for transformer
+
+    // Step 4: SEANet decoder
+    // init_conv: [d_model, n_tokens] -> [1024, n_tokens]
     std::vector<float> y;
+    int T_final = n_tokens_final;  // Token count after transformer (T_up)
 
     if (model.init_conv_w) {
         const float * w = (const float *)model.init_conv_w->data;
         const float * b = model.init_conv_b ? (const float *)model.init_conv_b->data : nullptr;
 
         // Weight shape: [in_ch=512, kernel=7, out_ch=1024]
-        conv1d(y, x, w, b, hp.d_model, 1024, 7, T);
+        conv1d(y, x, w, b, hp.d_model, 1024, 7, T_final);
+        float ic_min = y[0], ic_max = y[0];
+        for (size_t i = 0; i < y.size(); i++) {
+            if (y[i] < ic_min) ic_min = y[i];
+            if (y[i] > ic_max) ic_max = y[i];
+        }
+        printf("  init_conv: [%d, %d] -> [1024, %d], range [%.4f, %.4f]\n",
+               hp.d_model, T_final, T_final, ic_min, ic_max);
+        printf("    First 4 at ch=0, t=0: %.4f %.4f %.4f %.4f\n",
+               y[0], y[1 * T_final], y[2 * T_final], y[3 * T_final]);
         apply_elu(y);
-        printf("  init_conv: [%d, %d] -> [1024, %d]\n", hp.d_model, T, T);
         fflush(stdout);
     } else {
         fprintf(stderr, "Warning: init_conv not found, using identity\n");
         y = x;
     }
 
-    int cur_len = T;
+    int cur_len = T_final;
     int cur_ch = 1024;
 
     // 4 upsampling blocks with ratios [8, 6, 5, 4]
@@ -626,6 +1029,20 @@ static std::vector<float> decode(mimi_model & model, const std::vector<std::vect
         int out_ch = channels[i + 1];
         int in_ch = channels[i];
 
+        if (i == 0) {
+            // Debug: print input to first upsample (after init_conv + ELU)
+            float y_min = y[0], y_max = y[0];
+            for (size_t j = 0; j < y.size(); j++) {
+                if (y[j] < y_min) y_min = y[j];
+                if (y[j] > y_max) y_max = y[j];
+            }
+            printf("  Before upsample[0]: range [%.4f, %.4f]\n", y_min, y_max);
+            printf("    First 4 at ch=0, t=0: %.4f %.4f %.4f %.4f\n",
+                   y[0], y[1 * cur_len], y[2 * cur_len], y[3 * cur_len]);
+            printf("    First 4 at ch=0, t=1: %.4f %.4f %.4f %.4f\n",
+                   y[1], y[1 * cur_len + 1], y[2 * cur_len + 1], y[3 * cur_len + 1]);
+        }
+
         if (block.upsample_w) {
             const float * w = (const float *)block.upsample_w->data;
             const float * b = block.upsample_b ? (const float *)block.upsample_b->data : nullptr;
@@ -633,40 +1050,97 @@ static std::vector<float> decode(mimi_model & model, const std::vector<std::vect
             // Kernel size = 2 * ratio
             int kernel = 2 * ratio;
             std::vector<float> upsampled;
-            conv_transpose1d(upsampled, y, w, b, in_ch, out_ch, kernel, ratio, cur_len);
+            // Trim = kernel - stride (like PyTorch's unpad1d(y, (0, K-S)))
+            int trim_end = kernel - ratio;
+            conv_transpose1d(upsampled, y, w, b, in_ch, out_ch, kernel, ratio, cur_len, trim_end);
 
-            int new_len = (cur_len - 1) * ratio + kernel;
-            apply_elu(upsampled);
+            // Output length: (in-1)*stride + kernel - trim_end = (in-1)*stride + stride = in*stride
+            int new_len = cur_len * ratio;
 
-            // Residual block
+            // Debug: print range and first values after upsample
+            if (i == 0) {
+                float up_min = upsampled[0], up_max = upsampled[0];
+                for (size_t j = 0; j < upsampled.size(); j++) {
+                    if (upsampled[j] < up_min) up_min = upsampled[j];
+                    if (upsampled[j] > up_max) up_max = upsampled[j];
+                }
+                printf("    After upsample[0]: range [%.4f, %.4f]\n", up_min, up_max);
+                printf("      First 4 at ch=0, t=0: %.4f %.4f %.4f %.4f\n",
+                       upsampled[0], upsampled[1 * new_len], upsampled[2 * new_len], upsampled[3 * new_len]);
+            }
+
+            // NOTE: No ELU here! ELU is inside the ResBlock
+
+            // Residual block: shortcut(x) + block(ELU→Conv3→ELU→Conv1)
             if (block.res_conv1_w && block.res_conv2_w) {
-                std::vector<float> res;
+                // Block path: ELU -> Conv3 -> ELU -> Conv1
+                std::vector<float> block_out = upsampled;  // Copy for block path
+                apply_elu(block_out);  // ELU before first conv
+
                 const float * w1 = (const float *)block.res_conv1_w->data;
                 const float * b1 = block.res_conv1_b ? (const float *)block.res_conv1_b->data : nullptr;
 
-                // First conv: compress channels
-                conv1d(res, upsampled, w1, b1, out_ch, out_ch / 2, 3, new_len);
-                apply_elu(res);
+                // First conv: compress channels (out_ch -> out_ch/2)
+                std::vector<float> res;
+                conv1d(res, block_out, w1, b1, out_ch, out_ch / 2, 3, new_len);
+
+                if (i == 0) {
+                    float r_min = res[0], r_max = res[0];
+                    for (size_t j = 0; j < res.size(); j++) {
+                        if (res[j] < r_min) r_min = res[j];
+                        if (res[j] > r_max) r_max = res[j];
+                    }
+                    printf("      After Conv3: range [%.4f, %.4f]\n", r_min, r_max);
+                    printf("        First 4: %.4f %.4f %.4f %.4f\n",
+                           res[0], res[1 * new_len], res[2 * new_len], res[3 * new_len]);
+                }
+
+                apply_elu(res);  // ELU after first conv
 
                 const float * w2 = (const float *)block.res_conv2_w->data;
                 const float * b2 = block.res_conv2_b ? (const float *)block.res_conv2_b->data : nullptr;
 
-                // Second conv: expand channels back
+                // Second conv: expand channels back (out_ch/2 -> out_ch)
                 std::vector<float> res2;
                 conv1d(res2, res, w2, b2, out_ch / 2, out_ch, 1, new_len);
 
-                // Add residual
+                if (i == 0) {
+                    float r_min = res2[0], r_max = res2[0];
+                    for (size_t j = 0; j < res2.size(); j++) {
+                        if (res2[j] < r_min) r_min = res2[j];
+                        if (res2[j] > r_max) r_max = res2[j];
+                    }
+                    printf("      After Conv1: range [%.4f, %.4f]\n", r_min, r_max);
+                    printf("        First 4: %.4f %.4f %.4f %.4f\n",
+                           res2[0], res2[1 * new_len], res2[2 * new_len], res2[3 * new_len]);
+                }
+
+                // Add residual: shortcut (upsampled) + block (res2)
                 for (size_t j = 0; j < upsampled.size(); j++) {
                     upsampled[j] += res2[j];
                 }
+
+                if (i == 0) {
+                    float r_min = upsampled[0], r_max = upsampled[0];
+                    for (size_t j = 0; j < upsampled.size(); j++) {
+                        if (upsampled[j] < r_min) r_min = upsampled[j];
+                        if (upsampled[j] > r_max) r_max = upsampled[j];
+                    }
+                    printf("      After residual add: range [%.4f, %.4f]\n", r_min, r_max);
+                    printf("        First 4: %.4f %.4f %.4f %.4f\n",
+                           upsampled[0], upsampled[1 * new_len], upsampled[2 * new_len], upsampled[3 * new_len]);
+                }
             }
 
+            // ELU after the entire resblock
+            apply_elu(upsampled);
+
             y = std::move(upsampled);
-            cur_len = (cur_len - 1) * ratio + kernel;
+            cur_len = new_len;
             cur_ch = out_ch;
 
             printf("  upsample[%d]: ratio=%d, [%d, %d] -> [%d, %d]\n",
-                   i, ratio, in_ch, (cur_len - kernel + ratio - 1) / ratio + 1, out_ch, cur_len);
+                   i, ratio, in_ch, cur_len / ratio, out_ch, cur_len);
         }
     }
 
@@ -691,11 +1165,24 @@ static std::vector<float> decode(mimi_model & model, const std::vector<std::vect
         s = tanhf(s);
     }
 
+    // Trim to expected length: T * (sample_rate / frame_rate)
+    int expected_samples = (int)(T * hp.sample_rate / hp.frame_rate);
+    if ((int)audio.size() > expected_samples) {
+        printf("  Trimming from %zu to %d samples\n", audio.size(), expected_samples);
+        audio.resize(expected_samples);
+    }
+
     printf("Decode complete, %zu samples\n", audio.size());
     return audio;
 }
 
 int main(int argc, char ** argv) {
+    // Disable buffering for immediate output
+    setbuf(stdout, NULL);
+    setbuf(stderr, NULL);
+
+    fprintf(stderr, "DEBUG: mimi_decode starting...\n");
+
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <audio_tokens.json> [-o output.wav] [-m mimi.gguf]\n", argv[0]);
         return 1;
@@ -732,11 +1219,13 @@ int main(int argc, char ** argv) {
     printf("Loaded %zu frames\n", tokens.size());
 
     // Load model
+    printf("Loading model from %s...\n", model_path.c_str());
     mimi_model model;
     if (!load_model(model, model_path)) {
         fprintf(stderr, "Error: failed to load model\n");
         return 1;
     }
+    printf("Model loaded successfully\n");
 
     // Decode
     auto audio = decode(model, tokens);
