@@ -43,6 +43,27 @@ set_target_properties(mimi_decode PROPERTIES
     INSTALL_RPATH "${LLAMA_BUILD_DIR}/bin"
 )
 
+# Mimi encoder library
+add_library(mimi_lib STATIC src/mimi.cpp)
+target_link_libraries(mimi_lib ggml-base)
+
+# Mimi encode CLI tool
+add_executable(mimi_encode tools/mimi_encode.cpp)
+target_link_libraries(mimi_encode mimi_lib ggml-base)
+set_target_properties(mimi_encode PROPERTIES
+    BUILD_RPATH "${LLAMA_BUILD_DIR}/bin"
+    INSTALL_RPATH "${LLAMA_BUILD_DIR}/bin"
+)
+
+# Moshi Audio Server (with Mimi encoder + STT)
+add_executable(moshi_server tools/moshi_server.cpp)
+target_compile_definitions(moshi_server PRIVATE CPPHTTPLIB_NO_EXCEPTIONS)
+target_link_libraries(moshi_server mimi_lib moshi_stt_lib ggml-base)
+set_target_properties(moshi_server PROPERTIES
+    BUILD_RPATH "${LLAMA_BUILD_DIR}/bin"
+    INSTALL_RPATH "${LLAMA_BUILD_DIR}/bin"
+)
+
 # Tests
 enable_testing()
 

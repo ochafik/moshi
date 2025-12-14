@@ -154,6 +154,33 @@ bool STTModel::load(const std::string & path) {
     out_norm_alpha_ = get_tensor("out_norm.alpha");
     text_linear_ = get_tensor("text_linear.weight");
 
+    // Debug: print embedding shapes and values
+    if (text_emb_) {
+        fprintf(stderr, "text_emb shape: [%d, %d]\n", (int)text_emb_->ne[0], (int)text_emb_->ne[1]);
+        const float * d = (const float *)text_emb_->data;
+        int dim = (int)text_emb_->ne[0];
+        // Token 0 embedding: first `dim` values
+        fprintf(stderr, "  Token 0 first 5: [%.6f, %.6f, %.6f, %.6f, %.6f]\n",
+                d[0], d[1], d[2], d[3], d[4]);
+        // Token 8000 (BOS) embedding
+        fprintf(stderr, "  Token 8000 first 5: [%.6f, %.6f, %.6f, %.6f, %.6f]\n",
+                d[8000*dim], d[8000*dim+1], d[8000*dim+2], d[8000*dim+3], d[8000*dim+4]);
+    }
+    if (emb_[0]) {
+        fprintf(stderr, "audio_emb.0 shape: [%d, %d]\n", (int)emb_[0]->ne[0], (int)emb_[0]->ne[1]);
+        const float * d = (const float *)emb_[0]->data;
+        int dim = (int)emb_[0]->ne[0];
+        // Token 2048 (init) embedding
+        fprintf(stderr, "  Audio init (2048) first 5: [%.6f, %.6f, %.6f, %.6f, %.6f]\n",
+                d[2048*dim], d[2048*dim+1], d[2048*dim+2], d[2048*dim+3], d[2048*dim+4]);
+        // Token 1174 embedding
+        fprintf(stderr, "  Token 1174 first 5: [%.6f, %.6f, %.6f, %.6f, %.6f]\n",
+                d[1174*dim], d[1174*dim+1], d[1174*dim+2], d[1174*dim+3], d[1174*dim+4]);
+    }
+    if (text_linear_) {
+        fprintf(stderr, "text_linear shape: [%d, %d]\n", (int)text_linear_->ne[0], (int)text_linear_->ne[1]);
+    }
+
     loaded_ = true;
     return true;
 }
@@ -171,11 +198,14 @@ stt_result STTModel::transcribe(const std::vector<std::vector<int32_t>> & frames
     const int n_heads = hparams_.n_heads;
     const int head_dim = hparams_.head_dim();
 
-    // Text embedding for autoregressive feedback
+    // Text embedding tokens
     const float * text_emb_w = text_emb_ ? (const float *)text_emb_->data : nullptr;
-    const int text_bos_token = 8000;  // Initial/BOS text token
+    const int text_initial_token = hparams_.n_vocab_text;  // 8000 - initial token for frame 0
+    const int text_pad_token = 3;  // Padding token for subsequent frames
+    const int audio_initial_token = hparams_.n_vocab_audio;  // 2048 - initial audio token
 
     // KV cache for all layers and all positions
+    // We process T positions: [initial, audio[0], ..., audio[T-2]]
     std::vector<std::vector<std::vector<float>>> k_cache(hparams_.n_layers,
         std::vector<std::vector<float>>(T, std::vector<float>(dim)));
     std::vector<std::vector<std::vector<float>>> v_cache(hparams_.n_layers,
@@ -188,29 +218,60 @@ stt_result STTModel::transcribe(const std::vector<std::vector<int32_t>> & frames
     const float * out_norm_a = (const float *)out_norm_alpha_->data;
     const float * text_linear_w = (const float *)text_linear_->data;
 
-    int prev_text_token = text_bos_token;
+    // Process T positions: [initial, audio[0], ..., audio[T-2]]
+    // Position t uses: initial tokens if t==0, else audio frame t-1
+    // Output at position t predicts text for frame t
+    // IMPORTANT: Text is AUTOREGRESSIVE - we feed back the predicted text token
+    int prev_text_token = text_initial_token;  // Start with initial token
 
     for (int t = 0; t < T; t++) {
-        // 1. Embed: previous text token + current audio codes
         std::fill(x.begin(), x.end(), 0.0f);
 
-        // Add text embedding for previous token
-        if (text_emb_w && prev_text_token >= 0 && prev_text_token <= hparams_.n_vocab_text) {
+        // Frame 0: text = initial token (8000)
+        // Frames 1+: text = PREDICTED token from previous step (autoregressive)
+        int text_token = prev_text_token;
+        if (text_emb_w) {
             for (int d = 0; d < dim; d++) {
-                x[d] += text_emb_w[prev_text_token * dim + d];
+                x[d] += text_emb_w[text_token * dim + d];
             }
         }
 
-        // Add audio embeddings (frame 0 uses initial token, others use actual tokens)
-        const int audio_init_token = hparams_.n_vocab_audio;
+        // Audio embeddings
+        if (verbose && t <= 1) {
+            int audio_tok = (t == 0) ? audio_initial_token : frames[t-1][0];
+            fprintf(stderr, "  [debug] Position %d: text=%d, audio=[%d", t, text_token, audio_tok);
+            if (t > 0) {
+                for (int q = 1; q < std::min(4, hparams_.n_codebooks); q++) {
+                    fprintf(stderr, ",%d", frames[t-1][q]);
+                }
+            }
+            fprintf(stderr, "...]\n");
+        }
+
         for (int q = 0; q < hparams_.n_codebooks; q++) {
             if (!emb_[q]) continue;
-            int token = (t == 0) ? audio_init_token : frames[t][q];
-            if (token < 0 || token >= hparams_.n_vocab_audio + 1) token = audio_init_token;
+            int token;
+            if (t == 0) {
+                token = audio_initial_token;  // 2048 for all codebooks
+            } else {
+                token = frames[t-1][q];  // Actual audio token from frame t-1
+                if (token < 0 || token >= hparams_.n_vocab_audio) {
+                    token = audio_initial_token;
+                }
+            }
             const float * emb_w = (const float *)emb_[q]->data;
             for (int d = 0; d < dim; d++) {
                 x[d] += emb_w[token * dim + d];
             }
+        }
+
+        // Debug: print x after embedding
+        if (verbose && t == 0) {
+            float x_norm = 0.0f;
+            for (int d = 0; d < dim; d++) x_norm += x[d] * x[d];
+            x_norm = sqrtf(x_norm);
+            fprintf(stderr, "  [debug] After embed: norm=%.4f, first5=[%.5f,%.5f,%.5f,%.5f,%.5f]\n",
+                    x_norm, x[0], x[1], x[2], x[3], x[4]);
         }
 
         // 2. Run through all transformer layers
@@ -227,7 +288,25 @@ stt_result STTModel::transcribe(const std::vector<std::vector<int32_t>> & frames
 
             // Self-attention
             rms_norm(normed.data(), x.data(), norm1_a, dim);
+
+            // Debug after norm1 for layer 0, frame 0
+            if (verbose && t == 0 && layer == 0) {
+                float n_norm = 0.0f;
+                for (int d = 0; d < dim; d++) n_norm += normed[d] * normed[d];
+                n_norm = sqrtf(n_norm);
+                fprintf(stderr, "  [debug] After norm1: norm=%.4f, first5=[%.5f,%.5f,%.5f,%.5f,%.5f]\n",
+                        n_norm, normed[0], normed[1], normed[2], normed[3], normed[4]);
+            }
+
             matvec(qkv.data(), in_proj, normed.data(), 3 * dim, dim);
+
+            // Debug QKV for layer 0, frame 0
+            if (verbose && t == 0 && layer == 0) {
+                fprintf(stderr, "  [debug] Q first5=[%.5f,%.5f,%.5f,%.5f,%.5f]\n",
+                        qkv[0], qkv[1], qkv[2], qkv[3], qkv[4]);
+                fprintf(stderr, "  [debug] K first5=[%.5f,%.5f,%.5f,%.5f,%.5f]\n",
+                        qkv[dim], qkv[dim+1], qkv[dim+2], qkv[dim+3], qkv[dim+4]);
+            }
 
             float * Q = qkv.data();
             float * K = qkv.data() + dim;
@@ -302,10 +381,23 @@ stt_result STTModel::transcribe(const std::vector<std::vector<int32_t>> & frames
             if (logits[i] > logits[best]) best = i;
         }
         result.all_tokens[t] = best;
+
+        // Feed back predicted token for next step (autoregressive)
         prev_text_token = best;
 
         if (verbose && (t < 3 || best >= 4 || t == T - 1)) {
-            fprintf(stderr, "  Frame %d: token %d\n", t, best);
+            fprintf(stderr, "  Frame %d: token %d (logit=%.4f)", t, best, logits[best]);
+            // Show top 5 logits for debugging
+            std::vector<std::pair<float, int>> sorted_logits;
+            for (int i = 0; i < std::min(hparams_.n_vocab_text, 100); i++) {
+                sorted_logits.push_back({logits[i], i});
+            }
+            std::sort(sorted_logits.begin(), sorted_logits.end(), std::greater<>());
+            fprintf(stderr, " top5: ");
+            for (int i = 0; i < std::min(5, (int)sorted_logits.size()); i++) {
+                fprintf(stderr, "%d=%.2f ", sorted_logits[i].second, sorted_logits[i].first);
+            }
+            fprintf(stderr, "\n");
         }
     }
 
