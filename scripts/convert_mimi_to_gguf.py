@@ -181,15 +181,19 @@ def convert_pytorch_to_mlx_names(weights: dict) -> dict:
         k = k.replace(".block.1.", ".block.0.")
         k = k.replace(".block.3.", ".block.1.")
 
-        # Handle conv weight transposition (PyTorch: outC, inC, kSize -> MLX: outC, kSize, inC)
-        if (k.endswith(".conv.weight") or
-            k.endswith(".output_proj.weight") or
-            k.endswith(".input_proj.weight")):
-            value = np.swapaxes(value, -1, -2)
-
-        # Handle conv-transposed weights (PyTorch: inC, outC, kSize -> MLX: outC, kSize, inC)
-        if k.endswith(".convtr.weight"):
-            value = np.transpose(value, (1, 2, 0))
+        # NOTE: For GGML compatibility, we do NOT transpose conv weights!
+        # ggml_conv_1d expects kernel shape ne[] = [K, IC, OC]
+        # PyTorch Conv1d weight is [OC, IC, K]
+        # numpy row-major [OC, IC, K] -> GGML column-major ne[] = [K, IC, OC] ✓
+        #
+        # ggml_conv_transpose_1d expects kernel shape ne[] = [K, OC, IC]
+        # PyTorch ConvTranspose1d weight is [IC, OC, K]
+        # numpy row-major [IC, OC, K] -> GGML column-major ne[] = [K, OC, IC] ✓
+        #
+        # So NO TRANSPOSE needed for GGML! (Previously we transposed for MLX format)
+        #
+        # SURPRISE: Original code transposed to [OC, K, IC] for MLX format,
+        # but GGML needs the original PyTorch layout!
 
         converted[k] = value
 

@@ -1,6 +1,6 @@
 # Mimi Decoder C++ Implementation Progress
 
-## Status: ✅ WORKING (High Correlation)
+## Status: ✅ WORKING (High Correlation with GGML-Compatible Weights)
 
 ### Test Results (2024-12-14)
 
@@ -24,6 +24,21 @@
    - **Bug**: C++ used symmetric padding (remove from both ends)
    - **Fix**: Changed to end-trimming only (like PyTorch's `unpad1d(y, (0, K-S))`)
    - **Impact**: Correlation jumped from -0.55 to 0.999+ without transformer
+
+2. **GGUF Weight Layout** (for GGML compatibility)
+   - **Bug**: Converter transposed weights for MLX format `[OC, K, IC]`
+   - **Fix**: Removed transpose - keep PyTorch layout for GGML compatibility
+   - **GGML expects**:
+     - `ggml_conv_1d` kernel: `ne[] = [K, IC, OC]` ← PyTorch `[OC, IC, K]` stored directly
+     - `ggml_conv_transpose_1d` kernel: `ne[] = [K, OC, IC]` ← PyTorch `[IC, OC, K]` stored directly
+   - **Benefit**: Can now memory-map GGUF tensors directly without runtime transformation
+
+### Surprises/Learnings
+
+1. **ggml_conv_transpose_1d requires p0=0**: Padding must be 0 in GGML, use `ggml_view` to trim output
+2. **Weight layout confusion**: numpy row-major → GGML column-major, ne[0] is innermost/fastest
+3. **MLX vs GGML formats differ**: Had to undo MLX-specific transposes for GGML compatibility
+4. **Depthwise convtr weight shape**: `[K, OC=1, IC=512]` for per-channel kernels
 
 ### Architecture: Hybrid C++/GGML
 

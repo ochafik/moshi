@@ -480,8 +480,9 @@ static void conv_transpose1d(
     }
 
     // Scatter-add
-    // GGUF weight shape: [in_ch, kernel, out_ch] with ggml column-major layout
-    // To access w[ic][k][oc]: index = ic + k * in_ch + oc * in_ch * kernel
+    // GGUF weight shape: [K, OC, IC] in GGML ne[] order (matches ggml_conv_transpose_1d)
+    // PyTorch ConvTranspose1d weight was [IC, OC, K], stored directly without transpose
+    // To access w[k][oc][ic]: index = k + oc * kernel + ic * kernel * out_ch
     for (int ic = 0; ic < in_ch; ic++) {
         for (int t = 0; t < seq_len; t++) {
             float in_val = in[ic * seq_len + t];
@@ -489,7 +490,7 @@ static void conv_transpose1d(
 
             for (int k = 0; k < kernel; k++) {
                 for (int oc = 0; oc < out_ch; oc++) {
-                    int w_idx = ic + k * in_ch + oc * in_ch * kernel;
+                    int w_idx = k + oc * kernel + ic * kernel * out_ch;
                     full_out[oc * full_len + t_out + k] += in_val * weight[w_idx];
                 }
             }
@@ -515,8 +516,9 @@ static void conv1d(
     int out_len = seq_len;  // Same length output with causal padding
     out.assign(out_ch * out_len, 0.0f);
 
-    // GGUF weight shape: [in_ch, kernel, out_ch] with ggml column-major layout
-    // To access w[ic][k][oc]: index = ic + k * in_ch + oc * in_ch * kernel
+    // GGUF weight shape: [K, IC, OC] in GGML ne[] order (matches ggml_conv_1d)
+    // PyTorch weight was [OC, IC, K], stored directly without transpose
+    // To access w[k][ic][oc]: index = k + ic * kernel + oc * kernel * in_ch
     for (int oc = 0; oc < out_ch; oc++) {
         for (int t = 0; t < out_len; t++) {
             float sum = bias ? bias[oc] : 0.0f;
@@ -525,7 +527,7 @@ static void conv1d(
                 for (int k = 0; k < kernel; k++) {
                     int t_in = t - pad + k * dilation;
                     if (t_in >= 0 && t_in < seq_len) {
-                        int w_idx = ic + k * in_ch + oc * in_ch * kernel;
+                        int w_idx = k + ic * kernel + oc * kernel * in_ch;
                         sum += in[ic * seq_len + t_in] * weight[w_idx];
                     }
                 }
@@ -668,9 +670,9 @@ static std::vector<float> decode(mimi_model & model, const std::vector<std::vect
         printf("  Applying 2x upsample: [%d, %d] -> [%d, %d]\n", hp.d_model, T, hp.d_model, T_up);
         fflush(stdout);
 
-        // upsample_w GGUF shape: [512, 4, 1] with ggml dimension order
-        // In ggml: ne[0]=512, ne[1]=4, ne[2]=1
-        // Access: w[c + k * d_model] for channel c, kernel position k
+        // upsample_w GGUF shape: [K=4, OC=1, IC=512] in GGML ne[] order
+        // PyTorch weight was [IC=512, OC=1, K=4] for depthwise groups
+        // Access: w[k + c * kernel] for channel c, kernel position k
         const float * w = (const float *)model.upsample_w->data;
         const int kernel = 4;
         const int stride = 2;
@@ -685,8 +687,8 @@ static std::vector<float> decode(mimi_model & model, const std::vector<std::vect
                 for (int k = 0; k < kernel; k++) {
                     int t_out = t_in * stride + k;
                     if (t_out >= 0 && t_out < T_up) {
-                        // Note: ggml stores as [d_model, kernel], access w[c + k * d_model]
-                        x_up[c * T_up + t_out] += val * w[c + k * hp.d_model];
+                        // GGML ne[] = [K, OC=1, IC], access w[k][0][c] = k + c * kernel
+                        x_up[c * T_up + t_out] += val * w[k + c * kernel];
                     }
                 }
             }
