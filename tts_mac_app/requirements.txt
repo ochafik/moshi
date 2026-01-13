@@ -1,0 +1,41 @@
+# Moshi TTS Mac App - Requirements
+# Install with: pip install -r requirements.txt
+
+# py2app for building Mac application
+py2app>=0.28.0
+
+# MLX for Apple Silicon inference
+mlx>=0.5.0
+
+# Hugging Face Hub for model downloads
+huggingface_hub>=0.20.0
+
+# Text tokenizer
+sentencepiece>=0.1.99
+
+# Audio I/O
+sphn>=0.1.4
+
+# Data validation
+pydantic>=2.0.0
+
+# Tensor serialization
+safetensors>=0.4.0
+
+# Scientific computing
+numpy>=1.24.0
+
+# Optional: scipy for fallback audio I/O
+scipy>=1.10.0
+
+# Progress bars
+tqdm>=4.65.0
+
+# File locking for cache
+filelock>=3.12.0
+
+# Filesystem support
+fsspec>=2023.6.0
+
+# HTTP requests
+requests>=2.31.0
