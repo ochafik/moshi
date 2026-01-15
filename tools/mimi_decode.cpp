@@ -1,6 +1,6 @@
 // Mimi Neural Audio Codec Decoder
 // Standalone tool to decode audio tokens from JSON to WAV
-// Uses ggml for tensor operations
+// Uses ggml for tensor operations (including full SEANet with conv1d, conv_transpose1d, elu)
 
 #include <cmath>
 #include <cstdint>
@@ -17,6 +17,11 @@
 #include "ggml-cpu.h"
 #include "ggml-alloc.h"
 #include "gguf.h"
+
+std::vector<std::vector<int32_t>> parse_audio_tokens(const std::string & json_path);
+void save_wav(const std::string & path, const std::vector<float> & audio, int sample_rate);
+
+// Note: F32->F16 conversion is done using ggml_cast() in the graph
 
 // Mimi model parameters
 struct mimi_hparams {
@@ -92,136 +97,6 @@ struct mimi_model {
     struct gguf_context * gguf_ctx;
     std::map<std::string, struct ggml_tensor *> tensors;
 };
-
-// Simple JSON parsing for audio tokens
-static std::vector<std::vector<int32_t>> parse_audio_tokens(const std::string & json_path) {
-    fprintf(stderr, "  DEBUG: opening file...\n");
-    std::ifstream f(json_path);
-    if (!f.good()) {
-        fprintf(stderr, "  ERROR: cannot open file\n");
-        return {};
-    }
-    std::string content((std::istreambuf_iterator<char>(f)),
-                         std::istreambuf_iterator<char>());
-    fprintf(stderr, "  DEBUG: file read, %zu bytes\n", content.size());
-
-    std::vector<std::vector<int32_t>> tokens;
-    size_t pos = content.find("\"audio_tokens\"");
-    if (pos == std::string::npos) {
-        fprintf(stderr, "  ERROR: audio_tokens not found\n");
-        return tokens;
-    }
-    fprintf(stderr, "  DEBUG: found audio_tokens at pos %zu\n", pos);
-
-    pos = content.find('[', pos);
-    if (pos == std::string::npos) return tokens;
-
-    int frame_count = 0;
-    int loop_count = 0;
-    while (true) {
-        loop_count++;
-        if (loop_count > 1000) {
-            fprintf(stderr, "  ERROR: infinite loop detected at pos %zu\n", pos);
-            break;
-        }
-
-        pos = content.find('[', pos + 1);
-        if (pos == std::string::npos) break;
-
-        size_t check = content.find(']', pos);
-        size_t next_open = content.find('[', pos + 1);
-        fprintf(stderr, "    loop %d: pos=%zu, check=%zu, next_open=%zu\n", loop_count, pos, check, next_open);
-        if (check != std::string::npos && next_open > check) {
-            std::vector<int32_t> frame;
-            size_t end = content.find(']', pos);
-            std::string frame_str = content.substr(pos + 1, end - pos - 1);
-            fprintf(stderr, "      parsing frame: '%s'\n", frame_str.c_str());
-
-            size_t num_start = 0;
-            while (num_start < frame_str.size()) {
-                while (num_start < frame_str.size() &&
-                       (frame_str[num_start] == ' ' || frame_str[num_start] == ',' || frame_str[num_start] == '\n')) {
-                    num_start++;
-                }
-                if (num_start >= frame_str.size()) break;
-
-                size_t num_end = num_start;
-                while (num_end < frame_str.size() &&
-                       (frame_str[num_end] >= '0' && frame_str[num_end] <= '9')) {
-                    num_end++;
-                }
-                if (num_end > num_start) {
-                    frame.push_back(std::stoi(frame_str.substr(num_start, num_end - num_start)));
-                }
-                num_start = num_end;
-            }
-
-            fprintf(stderr, "      frame has %zu values\n", frame.size());
-            if (frame.size() == 8) {
-                tokens.push_back(frame);
-                frame_count++;
-            }
-            pos = end;
-        }
-
-        size_t next_bracket = content.find('[', pos + 1);
-        size_t end_array = content.find(']', pos + 1);
-        fprintf(stderr, "    after frame: next_bracket=%zu, end_array=%zu\n", next_bracket, end_array);
-        if (next_bracket == std::string::npos || (end_array != std::string::npos && end_array < next_bracket)) {
-            fprintf(stderr, "    breaking loop\n");
-            break;
-        }
-    }
-
-    fprintf(stderr, "  DEBUG: parsed %d frames\n", frame_count);
-    return tokens;
-}
-
-// Save WAV file
-static void save_wav(const std::string & path, const std::vector<float> & audio, int sample_rate) {
-    FILE * f = fopen(path.c_str(), "wb");
-    if (!f) {
-        fprintf(stderr, "Error: cannot open %s for writing\n", path.c_str());
-        return;
-    }
-
-    std::vector<int16_t> audio_i16(audio.size());
-    for (size_t i = 0; i < audio.size(); i++) {
-        float s = audio[i];
-        if (s > 1.0f) s = 1.0f;
-        if (s < -1.0f) s = -1.0f;
-        audio_i16[i] = (int16_t)(s * 32767.0f);
-    }
-
-    uint32_t data_size = audio_i16.size() * 2;
-    uint32_t file_size = 36 + data_size;
-
-    fwrite("RIFF", 1, 4, f);
-    fwrite(&file_size, 4, 1, f);
-    fwrite("WAVE", 1, 4, f);
-    fwrite("fmt ", 1, 4, f);
-
-    uint32_t fmt_size = 16;
-    uint16_t audio_format = 1;
-    uint16_t num_channels = 1;
-    uint32_t byte_rate = sample_rate * 2;
-    uint16_t block_align = 2;
-    uint16_t bits_per_sample = 16;
-
-    fwrite(&fmt_size, 4, 1, f);
-    fwrite(&audio_format, 2, 1, f);
-    fwrite(&num_channels, 2, 1, f);
-    fwrite(&sample_rate, 4, 1, f);
-    fwrite(&byte_rate, 4, 1, f);
-    fwrite(&block_align, 2, 1, f);
-    fwrite(&bits_per_sample, 2, 1, f);
-
-    fwrite("data", 1, 4, f);
-    fwrite(&data_size, 4, 1, f);
-    fwrite(audio_i16.data(), 2, audio_i16.size(), f);
-
-    fclose(f);
-}
 
 // Load Mimi model from GGUF
 static bool load_model(mimi_model & model, const std::string & path) {
@@ -388,160 +263,473 @@ static bool load_model(mimi_model & model, const std::string & path) {
     return true;
 }
 
-// ELU activation (used in SEANet)
-static inline float elu(float x) {
-    return x >= 0.0f ? x : (expf(x) - 1.0f);
-}
+// ============================================================================
+// GGML-based SEANet decoder
+// ============================================================================
 
-// GELU activation (used in transformer)
-static inline float gelu(float x) {
-    return 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x)));
-}
-
-// LayerNorm
-static void layer_norm(float * out, const float * in, const float * gamma, const float * beta,
-                       int n_features, int seq_len, float eps = 1e-5f) {
-    for (int t = 0; t < seq_len; t++) {
-        // Compute mean and variance
-        float mean = 0.0f, var = 0.0f;
-        for (int i = 0; i < n_features; i++) {
-            mean += in[t * n_features + i];
-        }
-        mean /= n_features;
-
-        for (int i = 0; i < n_features; i++) {
-            float diff = in[t * n_features + i] - mean;
-            var += diff * diff;
-        }
-        var /= n_features;
-
-        float std_inv = 1.0f / sqrtf(var + eps);
-
-        for (int i = 0; i < n_features; i++) {
-            float norm = (in[t * n_features + i] - mean) * std_inv;
-            out[t * n_features + i] = gamma[i] * norm + beta[i];
-        }
-    }
-}
-
-// Matrix multiply: C = A @ B^T (A is [M, K], B is [N, K], C is [M, N])
-static void matmul(float * C, const float * A, const float * B, int M, int K, int N) {
-    for (int m = 0; m < M; m++) {
-        for (int n = 0; n < N; n++) {
-            float sum = 0.0f;
-            for (int k = 0; k < K; k++) {
-                sum += A[m * K + k] * B[n * K + k];
-            }
-            C[m * N + n] = sum;
-        }
-    }
-}
-
-// Softmax over last dimension
-static void softmax(float * x, int n) {
-    float max_val = x[0];
-    for (int i = 1; i < n; i++) {
-        if (x[i] > max_val) max_val = x[i];
-    }
-
-    float sum = 0.0f;
-    for (int i = 0; i < n; i++) {
-        x[i] = expf(x[i] - max_val);
-        sum += x[i];
-    }
-
-    for (int i = 0; i < n; i++) {
-        x[i] /= sum;
-    }
-}
-
-// Transposed 1D convolution (upsampling)
-// trim_end: number of samples to remove from the end (like unpad1d(y, (0, trim_end)))
-static void conv_transpose1d(
-    std::vector<float> & out, const std::vector<float> & in,
-    const float * weight, const float * bias,
-    int in_ch, int out_ch, int kernel, int stride, int seq_len, int trim_end = 0
+// Helper: Causal pad input on the left (for causal convolution)
+// Input: [seq_len, channels, batch, 1], Output: [seq_len + pad, channels, batch, 1]
+// Uses ggml_pad_ext which pads with zeros: lp0=left pad dim0, rp0=right pad dim0
+static struct ggml_tensor * causal_pad_left(
+    struct ggml_context * ctx,
+    struct ggml_tensor * x,
+    int pad
 ) {
-    // Full output length before trimming
-    int full_len = (seq_len - 1) * stride + kernel;
-    // Final output length after trimming from the end only
-    int out_len = full_len - trim_end;
+    if (pad <= 0) return x;
 
-    // Work in full buffer first, then trim
-    std::vector<float> full_out(out_ch * full_len, 0.0f);
+    // ggml_pad_ext(ctx, a, lp0, rp0, lp1, rp1, lp2, rp2, lp3, rp3)
+    // For 4D tensor [seq_len, channels, batch, 1], pad dimension 0 on the left
+    return ggml_pad_ext(ctx, x, pad, 0, 0, 0, 0, 0, 0, 0);
+}
 
-    // Add bias to full buffer
+// Helper: Conv1d with causal padding using GGML
+// Input: [seq_len, in_ch, N, 1], Weight: F16 [K, in_ch, out_ch], Bias: F32 [out_ch]
+// Output: [out_seq, out_ch, N, 1] (same length due to causal padding)
+static struct ggml_tensor * ggml_conv1d_causal(
+    struct ggml_context * ctx,
+    struct ggml_tensor * x,       // F32 [seq_len, in_ch, N, 1]
+    struct ggml_tensor * w_f16,   // F16 [K, in_ch, out_ch]
+    struct ggml_tensor * bias,    // F32 [out_ch] or nullptr
+    int kernel,
+    int dilation
+) {
+    int64_t seq_len = x->ne[0];
+    int64_t out_ch = w_f16->ne[2];
+    int64_t batch = x->ne[2];
+
+    // Causal padding: all padding on the left
+    int pad = (kernel - 1) * dilation;
+    struct ggml_tensor * x_padded = causal_pad_left(ctx, x, pad);
+
+    // Conv1d with no padding (padding already applied manually)
+    // Output length: seq_len + pad - dilation*(kernel-1) - 1 + 1 = seq_len
+    // Output shape: [out_seq, out_ch, N, 1]
+    struct ggml_tensor * y = ggml_conv_1d(ctx, w_f16, x_padded, 1, 0, dilation);
+
+    // Add bias: y is [out_seq, out_ch, N, 1], bias is [out_ch]
     if (bias) {
-        for (int oc = 0; oc < out_ch; oc++) {
-            for (int t = 0; t < full_len; t++) {
-                full_out[oc * full_len + t] = bias[oc];
-            }
-        }
+        // For 4D output, need to broadcast bias across seq_len, batch dims
+        // ggml_add broadcasts along dims where bias has size 1
+        struct ggml_tensor * bias_4d = ggml_reshape_4d(ctx, bias, 1, out_ch, 1, 1);
+        y = ggml_add(ctx, y, bias_4d);
     }
 
-    // Scatter-add
-    // GGUF weight shape: [K, OC, IC] in GGML ne[] order (matches ggml_conv_transpose_1d)
-    // PyTorch ConvTranspose1d weight was [IC, OC, K], stored directly without transpose
-    // To access w[k][oc][ic]: index = k + oc * kernel + ic * kernel * out_ch
-    for (int ic = 0; ic < in_ch; ic++) {
-        for (int t = 0; t < seq_len; t++) {
-            float in_val = in[ic * seq_len + t];
-            int t_out = t * stride;
-
-            for (int k = 0; k < kernel; k++) {
-                for (int oc = 0; oc < out_ch; oc++) {
-                    int w_idx = k + oc * kernel + ic * kernel * out_ch;
-                    full_out[oc * full_len + t_out + k] += in_val * weight[w_idx];
-                }
-            }
-        }
-    }
-
-    // Extract from start, trimming from the end only
-    out.resize(out_ch * out_len);
-    for (int oc = 0; oc < out_ch; oc++) {
-        for (int t = 0; t < out_len; t++) {
-            out[oc * out_len + t] = full_out[oc * full_len + t];
-        }
-    }
+    return y;
 }
 
-// Regular 1D convolution
-static void conv1d(
-    std::vector<float> & out, const std::vector<float> & in,
-    const float * weight, const float * bias,
-    int in_ch, int out_ch, int kernel, int seq_len, int dilation = 1
+// Helper: ConvTranspose1d with output trimming using GGML
+// Input: [seq_len, in_ch], Weight: F32 [K, out_ch, in_ch]
+// Output: [seq_len * stride, out_ch] (after trimming kernel-stride samples from end)
+static struct ggml_tensor * ggml_conv_transpose1d_trimmed(
+    struct ggml_context * ctx,
+    struct ggml_tensor * x,       // F32 [seq_len, in_ch]
+    struct ggml_tensor * weight,  // F32 [K, out_ch, in_ch]
+    struct ggml_tensor * bias,    // F32 [out_ch] or nullptr
+    int kernel,
+    int stride
 ) {
-    int pad = (kernel - 1) * dilation;  // Causal padding
-    int out_len = seq_len;  // Same length output with causal padding
-    out.assign(out_ch * out_len, 0.0f);
+    int64_t seq_len = x->ne[0];
+    int64_t out_ch = weight->ne[1];
 
-    // GGUF weight shape: [K, IC, OC] in GGML ne[] order (matches ggml_conv_1d)
-    // PyTorch weight was [OC, IC, K], stored directly without transpose
-    // To access w[k][ic][oc]: index = k + ic * kernel + oc * kernel * in_ch
-    for (int oc = 0; oc < out_ch; oc++) {
-        for (int t = 0; t < out_len; t++) {
-            float sum = bias ? bias[oc] : 0.0f;
+    // ConvTranspose1d: output_len = (seq_len - 1) * stride + kernel
+    // ggml_conv_transpose_1d requires p0=0
+    struct ggml_tensor * y = ggml_conv_transpose_1d(ctx, weight, x, stride, 0, 1);
 
-            for (int ic = 0; ic < in_ch; ic++) {
-                for (int k = 0; k < kernel; k++) {
-                    int t_in = t - pad + k * dilation;
-                    if (t_in >= 0 && t_in < seq_len) {
-                        int w_idx = k + ic * kernel + oc * kernel * in_ch;
-                        sum += in[ic * seq_len + t_in] * weight[w_idx];
-                    }
-                }
-            }
-            out[oc * out_len + t] = sum;
-        }
+    // Full output length
+    int64_t full_len = (seq_len - 1) * stride + kernel;
+
+    // Trim from end: remove (kernel - stride) samples
+    int trim = kernel - stride;
+    int64_t out_len = full_len - trim;  // = seq_len * stride
+
+    // Use view to trim (only take first out_len samples)
+    y = ggml_view_2d(ctx, y, out_len, out_ch, y->nb[1], 0);
+    y = ggml_cont(ctx, y);
+
+    // Add bias
+    if (bias) {
+        y = ggml_cont(ctx, ggml_transpose(ctx, y));
+        y = ggml_add(ctx, y, bias);
+        y = ggml_cont(ctx, ggml_transpose(ctx, y));
     }
+
+    return y;
 }
 
-// Apply ELU activation in-place
-static void apply_elu(std::vector<float> & x) {
-    for (auto & v : x) {
-        v = elu(v);
+// Run full SEANet decoder using GGML
+// Input: x [d_model, seq_len] layout in memory (will be transposed internally)
+// Output: audio [1, samples]
+static std::vector<float> seanet_decode_ggml(
+    mimi_model & model,
+    const std::vector<float> & x_in,  // [d_model, seq_len] row-major
+    int seq_len
+) {
+    const auto & hp = model.hparams;
+    int d_model = hp.d_model;
+
+    printf("  Running SEANet decoder with GGML...\n");
+    fflush(stdout);
+
+    // Initialize CPU backend
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    if (!backend) {
+        fprintf(stderr, "Error: failed to create CPU backend for SEANet\n");
+        return {};
     }
+
+    // Calculate total output samples after all upsampling: seq_len * 8 * 6 * 5 * 4 = seq_len * 960
+    int final_len = seq_len;
+    for (int r : {8, 6, 5, 4}) final_len *= r;
+
+    // Create context for graph
+    // Need enough space for many tensors (convs, activations, residuals)
+    size_t ctx_size = ggml_tensor_overhead() * 512 + ggml_graph_overhead();
+    struct ggml_init_params ctx_params = {
+        .mem_size = ctx_size,
+        .mem_buffer = nullptr,
+        .no_alloc = true,
+    };
+    struct ggml_context * ctx = ggml_init(ctx_params);
+    if (!ctx) {
+        fprintf(stderr, "Error: failed to create GGML context for SEANet\n");
+        ggml_backend_free(backend);
+        return {};
+    }
+
+    // Input tensor: [seq_len, d_model, 1, 1]
+    // GGML conv_1d expects [IL, IC, batch, 1] - 4D with ne[3]=1
+    struct ggml_tensor * inp = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, seq_len, d_model, 1, 1);
+    ggml_set_name(inp, "seanet_input");
+    ggml_set_input(inp);
+    ggml_set_output(inp);  // Also set as output to verify data
+
+    // Weight tensors (F32, will be cast to F16 in graph for conv1d)
+    // init_conv: [K=7, IC=512, OC=1024]
+    int init_k = 7, init_ic = d_model, init_oc = 1024;
+    struct ggml_tensor * init_w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, init_k, init_ic, init_oc);
+    struct ggml_tensor * init_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, init_oc);
+    ggml_set_input(init_w);
+    ggml_set_input(init_b);
+
+    // Cast init_conv weight to F16 for ggml_conv_1d (required by im2col)
+    struct ggml_tensor * init_w_f16 = ggml_cast(ctx, init_w, GGML_TYPE_F16);
+    ggml_set_name(init_w_f16, "debug_init_w_f16");
+    ggml_set_output(init_w_f16);  // Add as output so we can verify the cast
+
+    // Current tensor - start with input
+    struct ggml_tensor * cur = inp;
+
+    // init_conv: Conv1d with causal padding (all on left)
+    int causal_pad = init_k - 1;  // kernel=7 -> pad=6
+
+    // Apply causal padding manually (pad left), then conv with no padding
+    struct ggml_tensor * cur_padded = causal_pad_left(ctx, cur, causal_pad);
+    struct ggml_tensor * conv_out = ggml_conv_1d(ctx, init_w_f16, cur_padded, 1, 0, 1);
+
+    // Add bias
+    struct ggml_tensor * bias_4d = ggml_reshape_4d(ctx, init_b, 1, init_oc, 1, 1);
+    struct ggml_tensor * with_bias = ggml_add(ctx, conv_out, bias_4d);
+
+    // Apply ELU
+    cur = ggml_elu(ctx, with_bias);
+
+    // SEANet blocks: 4 upsampling blocks with ratios [8, 6, 5, 4]
+    int ratios[] = {8, 6, 5, 4};
+    int channels[] = {1024, 512, 256, 128, 64};
+
+    // Pre-declare weight tensors for all blocks (F32, cast to F16 in graph)
+    struct {
+        struct ggml_tensor * up_w;       // ConvTranspose weight (F32)
+        struct ggml_tensor * up_b;       // ConvTranspose bias
+        struct ggml_tensor * res1_w;     // Residual conv1 weight (F32)
+        struct ggml_tensor * res1_b;     // Residual conv1 bias
+        struct ggml_tensor * res2_w;     // Residual conv2 weight (F32)
+        struct ggml_tensor * res2_b;     // Residual conv2 bias
+        // Cast versions for conv1d
+        struct ggml_tensor * res1_w_f16;
+        struct ggml_tensor * res2_w_f16;
+    } block_weights[4];
+
+    for (int i = 0; i < 4; i++) {
+        int ratio = ratios[i];
+        int in_ch = channels[i];
+        int out_ch = channels[i + 1];
+        int up_kernel = 2 * ratio;
+
+        // ConvTranspose weight: [K, out_ch, in_ch] - stays F32
+        block_weights[i].up_w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, up_kernel, out_ch, in_ch);
+        block_weights[i].up_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out_ch);
+        ggml_set_input(block_weights[i].up_w);
+        ggml_set_input(block_weights[i].up_b);
+
+        // Residual conv1: kernel=3, out_ch -> out_ch/2 (F32 input, cast to F16)
+        block_weights[i].res1_w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, out_ch, out_ch / 2);
+        block_weights[i].res1_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out_ch / 2);
+        ggml_set_input(block_weights[i].res1_w);
+        ggml_set_input(block_weights[i].res1_b);
+        block_weights[i].res1_w_f16 = ggml_cast(ctx, block_weights[i].res1_w, GGML_TYPE_F16);
+
+        // Residual conv2: kernel=1, out_ch/2 -> out_ch (F32 input, cast to F16)
+        block_weights[i].res2_w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, out_ch / 2, out_ch);
+        block_weights[i].res2_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out_ch);
+        ggml_set_input(block_weights[i].res2_w);
+        ggml_set_input(block_weights[i].res2_b);
+        block_weights[i].res2_w_f16 = ggml_cast(ctx, block_weights[i].res2_w, GGML_TYPE_F16);
+    }
+
+    // Build graph for all 4 blocks
+    for (int i = 0; i < 4; i++) {
+        int ratio = ratios[i];
+        int out_ch = channels[i + 1];
+        int up_kernel = 2 * ratio;
+
+        // Upsample with ConvTranspose1d
+        cur = ggml_conv_transpose1d_trimmed(ctx, cur, block_weights[i].up_w, block_weights[i].up_b, up_kernel, ratio);
+
+        // Save for residual connection
+        struct ggml_tensor * shortcut = cur;
+
+        // Residual block: ELU -> Conv3 -> ELU -> Conv1
+        struct ggml_tensor * blk = ggml_elu(ctx, cur);
+        blk = ggml_conv1d_causal(ctx, blk, block_weights[i].res1_w_f16, block_weights[i].res1_b, 3, 1);
+        blk = ggml_elu(ctx, blk);
+        blk = ggml_conv1d_causal(ctx, blk, block_weights[i].res2_w_f16, block_weights[i].res2_b, 1, 1);
+
+        // Residual add
+        cur = ggml_add(ctx, shortcut, blk);
+
+        // ELU after residual
+        cur = ggml_elu(ctx, cur);
+    }
+
+    // final_conv: [64, L] -> [1, L] with kernel=3
+    struct ggml_tensor * final_w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, 64, 1);
+    struct ggml_tensor * final_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    ggml_set_input(final_w);
+    ggml_set_input(final_b);
+    struct ggml_tensor * final_w_f16 = ggml_cast(ctx, final_w, GGML_TYPE_F16);
+
+    cur = ggml_conv1d_causal(ctx, cur, final_w_f16, final_b, 3, 1);
+
+    // tanh activation
+    cur = ggml_tanh(ctx, cur);
+
+    ggml_set_name(cur, "seanet_output");
+    ggml_set_output(cur);
+
+    // Build graph
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, cur);
+    printf("  DEBUG: graph has %d nodes\n", ggml_graph_n_nodes(gf));
+
+    // Allocate backend buffer
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (!buf) {
+        fprintf(stderr, "Error: failed to allocate backend buffer for SEANet\n");
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return {};
+    }
+
+    // Set input data: convert from [d_model, seq_len] row-major to GGML [seq_len, d_model, 1, 1] layout
+    // GGML 4D tensor has ne[0]=seq_len, ne[1]=d_model, ne[2]=1, ne[3]=1
+    // Memory layout: data[t + d * seq_len] = value at time t, dimension d
+    // x_in is in [d_model, seq_len] row-major: x_in[d * seq_len + t] = channel d, time t
+    size_t inp_nbytes = ggml_nbytes(inp);
+    size_t expected_bytes = seq_len * d_model * sizeof(float);
+    printf("  DEBUG: inp tensor nbytes=%zu, expected=%zu, nelements=%lld\n",
+           inp_nbytes, expected_bytes, ggml_nelements(inp));
+
+    std::vector<float> inp_transposed(seq_len * d_model);
+    for (int t = 0; t < seq_len; t++) {
+        for (int d = 0; d < d_model; d++) {
+            // GGML layout: index = t + d * seq_len
+            inp_transposed[t + d * seq_len] = x_in[d * seq_len + t];
+        }
+    }
+    ggml_backend_tensor_set(inp, inp_transposed.data(), 0, inp_transposed.size() * sizeof(float));
+
+    // Verify the data was set by reading it back
+    std::vector<float> inp_verify(seq_len * d_model);
+    ggml_backend_tensor_get(inp, inp_verify.data(), 0, inp_verify.size() * sizeof(float));
+    float v_min = inp_verify[0], v_max = inp_verify[0];
+    for (auto v : inp_verify) { if (v < v_min) v_min = v; if (v > v_max) v_max = v; }
+    printf("  DEBUG: inp data after set: range=[%.4f, %.4f], first 4: %.4f %.4f %.4f %.4f\n",
+           v_min, v_max, inp_verify[0], inp_verify[seq_len], inp_verify[2*seq_len], inp_verify[3*seq_len]);
+
+    // Debug: verify input was set
+    float inp_min = inp_transposed[0], inp_max = inp_transposed[0];
+    for (auto v : inp_transposed) { if (v < inp_min) inp_min = v; if (v > inp_max) inp_max = v; }
+    printf("  DEBUG SEANet input: range=[%.4f, %.4f], first 4: %.4f %.4f %.4f %.4f\n",
+           inp_min, inp_max, inp_transposed[0], inp_transposed[seq_len], inp_transposed[2*seq_len], inp_transposed[3*seq_len]);
+
+    // Set init_conv weights (F32, graph will cast to F16)
+    if (model.init_conv_w) {
+        ggml_backend_tensor_set(init_w, model.init_conv_w->data, 0, ggml_nbytes(init_w));
+        // Debug: verify init_conv weights
+        const float * w_ptr = (const float *)model.init_conv_w->data;
+        size_t w_size = ggml_nelements(model.init_conv_w);
+        float w_min = w_ptr[0], w_max = w_ptr[0];
+        for (size_t i = 0; i < w_size; i++) { if (w_ptr[i] < w_min) w_min = w_ptr[i]; if (w_ptr[i] > w_max) w_max = w_ptr[i]; }
+        printf("  DEBUG init_conv_w (model): ne=[%lld, %lld, %lld], range=[%.4f, %.4f]\n",
+               model.init_conv_w->ne[0], model.init_conv_w->ne[1], model.init_conv_w->ne[2], w_min, w_max);
+        printf("  DEBUG init_conv_w first 4: %.6f %.6f %.6f %.6f\n", w_ptr[0], w_ptr[1], w_ptr[2], w_ptr[3]);
+
+        // Read back the F32 tensor to verify it was set
+        std::vector<float> w_readback(init_k * init_ic * init_oc);
+        ggml_backend_tensor_get(init_w, w_readback.data(), 0, w_readback.size() * sizeof(float));
+        printf("  DEBUG init_w (readback): first 4: %.6f %.6f %.6f %.6f\n",
+               w_readback[0], w_readback[1], w_readback[2], w_readback[3]);
+    }
+    if (model.init_conv_b) {
+        ggml_backend_tensor_set(init_b, model.init_conv_b->data, 0, ggml_nbytes(model.init_conv_b));
+    }
+
+    // Set block weights (F32, graph will cast conv weights to F16)
+    for (int i = 0; i < 4; i++) {
+        auto & block = model.seanet_blocks[i];
+
+        // ConvTranspose weights (F32)
+        if (block.upsample_w) {
+            ggml_backend_tensor_set(block_weights[i].up_w, block.upsample_w->data, 0, ggml_nbytes(block.upsample_w));
+        }
+        if (block.upsample_b) {
+            ggml_backend_tensor_set(block_weights[i].up_b, block.upsample_b->data, 0, ggml_nbytes(block.upsample_b));
+        }
+
+        // Residual conv1 weights (F32)
+        if (block.res_conv1_w) {
+            ggml_backend_tensor_set(block_weights[i].res1_w, block.res_conv1_w->data, 0, ggml_nbytes(block.res_conv1_w));
+        }
+        if (block.res_conv1_b) {
+            ggml_backend_tensor_set(block_weights[i].res1_b, block.res_conv1_b->data, 0, ggml_nbytes(block.res_conv1_b));
+        }
+
+        // Residual conv2 weights (F32)
+        if (block.res_conv2_w) {
+            ggml_backend_tensor_set(block_weights[i].res2_w, block.res_conv2_w->data, 0, ggml_nbytes(block.res_conv2_w));
+        }
+        if (block.res_conv2_b) {
+            ggml_backend_tensor_set(block_weights[i].res2_b, block.res_conv2_b->data, 0, ggml_nbytes(block.res_conv2_b));
+        }
+    }
+
+    // Set final_conv weights (F32, graph will cast to F16)
+    if (model.final_conv_w) {
+        ggml_backend_tensor_set(final_w, model.final_conv_w->data, 0, ggml_nbytes(model.final_conv_w));
+    }
+    if (model.final_conv_b) {
+        ggml_backend_tensor_set(final_b, model.final_conv_b->data, 0, ggml_nbytes(model.final_conv_b));
+    }
+
+    // Compute
+    printf("  Computing SEANet graph...\n");
+    fflush(stdout);
+
+    enum ggml_status status = ggml_backend_graph_compute(backend, gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "Error: SEANet compute failed, status=%d\n", (int)status);
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        ggml_backend_free(backend);
+        return {};
+    }
+
+    // Debug: check raw conv output (before bias)
+    struct ggml_tensor * debug_conv_raw = ggml_get_tensor(ctx, "debug_conv_out_raw");
+    if (debug_conv_raw) {
+        std::vector<float> conv_raw_data(ggml_nelements(debug_conv_raw));
+        ggml_backend_tensor_get(debug_conv_raw, conv_raw_data.data(), 0, ggml_nbytes(debug_conv_raw));
+        float cmin = conv_raw_data[0], cmax = conv_raw_data[0];
+        for (auto v : conv_raw_data) { if (v < cmin) cmin = v; if (v > cmax) cmax = v; }
+        printf("  DEBUG conv_out_raw (before bias): range=[%.4f, %.4f], first 4: %.4f %.4f %.4f %.4f\n",
+               cmin, cmax, conv_raw_data[0], conv_raw_data[seq_len], conv_raw_data[2*seq_len], conv_raw_data[3*seq_len]);
+    }
+
+    // Debug: check bias tensor
+    struct ggml_tensor * debug_bias = ggml_get_tensor(ctx, "debug_bias_4d");
+    if (debug_bias) {
+        std::vector<float> bias_data(ggml_nelements(debug_bias));
+        ggml_backend_tensor_get(debug_bias, bias_data.data(), 0, ggml_nbytes(debug_bias));
+        float bmin = bias_data[0], bmax = bias_data[0];
+        for (auto v : bias_data) { if (v < bmin) bmin = v; if (v > bmax) bmax = v; }
+        printf("  DEBUG bias_4d: range=[%.4f, %.4f], first 4: %.4f %.4f %.4f %.4f\n",
+               bmin, bmax, bias_data[0], bias_data[1], bias_data[2], bias_data[3]);
+    }
+
+    // Debug: check with_bias tensor
+    struct ggml_tensor * debug_with_bias = ggml_get_tensor(ctx, "debug_with_bias");
+    if (debug_with_bias) {
+        std::vector<float> wb_data(ggml_nelements(debug_with_bias));
+        ggml_backend_tensor_get(debug_with_bias, wb_data.data(), 0, ggml_nbytes(debug_with_bias));
+        float wbmin = wb_data[0], wbmax = wb_data[0];
+        for (auto v : wb_data) { if (v < wbmin) wbmin = v; if (v > wbmax) wbmax = v; }
+        printf("  DEBUG with_bias: range=[%.4f, %.4f], first 4: %.4f %.4f %.4f %.4f\n",
+               wbmin, wbmax, wb_data[0], wb_data[seq_len], wb_data[2*seq_len], wb_data[3*seq_len]);
+    }
+
+    // Debug: check init_w_f16 cast output
+    struct ggml_tensor * debug_w_f16 = ggml_get_tensor(ctx, "debug_init_w_f16");
+    if (debug_w_f16) {
+        size_t w_bytes = ggml_nbytes(debug_w_f16);
+        std::vector<uint16_t> w_f16_data(ggml_nelements(debug_w_f16));
+        ggml_backend_tensor_get(debug_w_f16, w_f16_data.data(), 0, w_bytes);
+        // Convert first few F16 values to F32 for printing
+        float w0 = ggml_fp16_to_fp32(w_f16_data[0]);
+        float w1 = ggml_fp16_to_fp32(w_f16_data[1]);
+        float w2 = ggml_fp16_to_fp32(w_f16_data[2]);
+        float w3 = ggml_fp16_to_fp32(w_f16_data[3]);
+        printf("  DEBUG init_w_f16 (after cast): first 4 values = %.6f %.6f %.6f %.6f\n",
+               w0, w1, w2, w3);
+    }
+
+    // Debug: check if input tensor was preserved after computation
+    struct ggml_tensor * debug_inp = ggml_get_tensor(ctx, "seanet_input");
+    if (debug_inp) {
+        std::vector<float> inp_after(seq_len * d_model);
+        ggml_backend_tensor_get(debug_inp, inp_after.data(), 0, inp_after.size() * sizeof(float));
+        float inp_min_after = inp_after[0], inp_max_after = inp_after[0];
+        for (auto v : inp_after) { if (v < inp_min_after) inp_min_after = v; if (v > inp_max_after) inp_max_after = v; }
+        printf("  DEBUG inp (after compute): range=[%.4f, %.4f], first 4: %.4f %.4f %.4f %.4f\n",
+               inp_min_after, inp_max_after, inp_after[0], inp_after[seq_len], inp_after[2*seq_len], inp_after[3*seq_len]);
+    }
+
+    // Debug: print final output
+    struct ggml_tensor * debug_output = ggml_get_tensor(ctx, "seanet_output");
+    if (debug_output) {
+        int64_t n0 = debug_output->ne[0];  // samples
+        int64_t n1 = debug_output->ne[1];  // channels (should be 1)
+        std::vector<float> out_data(n0 * n1);
+        ggml_backend_tensor_get(debug_output, out_data.data(), 0, out_data.size() * sizeof(float));
+        float omin = out_data[0], omax = out_data[0];
+        for (auto v : out_data) { if (v < omin) omin = v; if (v > omax) omax = v; }
+        printf("  DEBUG seanet_output: shape=[%lld, %lld], range=[%.4f, %.4f]\n", n0, n1, omin, omax);
+        printf("    first 10 samples: %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+               out_data[0], out_data[1], out_data[2], out_data[3], out_data[4],
+               out_data[5], out_data[6], out_data[7], out_data[8], out_data[9]);
+    }
+
+    // Get output: cur is [final_len, 1]
+    int64_t out_len = cur->ne[0];
+    std::vector<float> audio(out_len);
+    ggml_backend_tensor_get(cur, audio.data(), 0, out_len * sizeof(float));
+
+    printf("  SEANet done, output %lld samples\n", (long long)out_len);
+
+    // Debug: print range
+    float amin = audio[0], amax = audio[0];
+    for (auto v : audio) {
+        if (v < amin) amin = v;
+        if (v > amax) amax = v;
+    }
+    printf("  Audio range: [%.4f, %.4f]\n", amin, amax);
+
+    // Cleanup
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    ggml_backend_free(backend);
+
+    return audio;
 }
 
 // Decode audio tokens to waveform
@@ -670,12 +858,14 @@ static std::vector<float> decode(mimi_model & model, const std::vector<std::vect
         printf("  Applying 2x upsample: [%d, %d] -> [%d, %d]\n", hp.d_model, T, hp.d_model, T_up);
         fflush(stdout);
 
-        // upsample_w GGUF shape: [K=4, OC=1, IC=512] in GGML ne[] order
+        // upsample_w GGUF shape: ne[] = [IC=512, K=4, OC=1]
         // PyTorch weight was [IC=512, OC=1, K=4] for depthwise groups
-        // Access: w[k + c * kernel] for channel c, kernel position k
+        // GGML stores in column-major order, so to access channel c, kernel k:
+        // w[c + k * n_channels]
         const float * w = (const float *)model.upsample_w->data;
         const int kernel = 4;
         const int stride = 2;
+        const int n_channels = hp.d_model;
 
         std::vector<float> x_up(hp.d_model * T_up, 0.0f);
 
@@ -687,8 +877,8 @@ static std::vector<float> decode(mimi_model & model, const std::vector<std::vect
                 for (int k = 0; k < kernel; k++) {
                     int t_out = t_in * stride + k;
                     if (t_out >= 0 && t_out < T_up) {
-                        // GGML ne[] = [K, OC=1, IC], access w[k][0][c] = k + c * kernel
-                        x_up[c * T_up + t_out] += val * w[k + c * kernel];
+                        // GGML ne[] = [IC, K, OC], access w[c][k][0] = c + k * n_channels
+                        x_up[c * T_up + t_out] += val * w[c + k * n_channels];
                     }
                 }
             }
@@ -741,6 +931,20 @@ static std::vector<float> decode(mimi_model & model, const std::vector<std::vect
             x_transposed[t * n_embd + d] = x[d * n_tokens + t];
         }
     }
+
+    // Debug: print transformer input values (compare with Python)
+    printf("  Transformer input @ t=0 (first 8): ");
+    for (int i = 0; i < 8 && i < n_embd; i++) {
+        printf("%.6f ", x_transposed[i]);
+    }
+    printf("\n");
+    float inp_min = x_transposed[0], inp_max = x_transposed[0];
+    for (size_t i = 0; i < x_transposed.size(); i++) {
+        if (x_transposed[i] < inp_min) inp_min = x_transposed[i];
+        if (x_transposed[i] > inp_max) inp_max = x_transposed[i];
+    }
+    printf("  Transformer input range: [%.4f, %.4f]\n", inp_min, inp_max);
+    fflush(stdout);
 
     // Initialize CPU backend
     ggml_backend_t backend = ggml_backend_cpu_init();
@@ -821,9 +1025,11 @@ static std::vector<float> decode(mimi_model & model, const std::vector<std::vect
         if (b_norm1) {
             norm1 = ggml_add(ctx, norm1, b_norm1);
         }
+        ggml_set_name(norm1, "debug_norm1");
 
         // QKV projection
         struct ggml_tensor * qkv = ggml_mul_mat(ctx, w_in_proj, norm1);
+        ggml_set_name(qkv, "debug_qkv");
 
         // Split Q, K, V - use cont to make them contiguous
         struct ggml_tensor * Qcur = ggml_cont(ctx, ggml_view_2d(ctx, qkv, n_embd, n_tokens, qkv->nb[1], 0));
@@ -839,9 +1045,11 @@ static std::vector<float> decode(mimi_model & model, const std::vector<std::vect
         Qcur = ggml_rope_ext(ctx, Qcur, inp_pos, nullptr,
                 n_embd_head, GGML_ROPE_TYPE_NORMAL, 0, 10000.0f, 1.0f,
                 0.0f, 1.0f, 0.0f, 0.0f);
+        ggml_set_name(Qcur, "debug_q_rope");
         Kcur = ggml_rope_ext(ctx, Kcur, inp_pos, nullptr,
                 n_embd_head, GGML_ROPE_TYPE_NORMAL, 0, 10000.0f, 1.0f,
                 0.0f, 1.0f, 0.0f, 0.0f);
+        ggml_set_name(Kcur, "debug_k_rope");
 
         // Permute for attention: [head_dim, n_head, n_tokens] -> [head_dim, n_tokens, n_head]
         struct ggml_tensor * q = ggml_permute(ctx, Qcur, 0, 2, 1, 3);
@@ -851,28 +1059,42 @@ static std::vector<float> decode(mimi_model & model, const std::vector<std::vect
         // Compute attention: K @ Q^T
         struct ggml_tensor * kq = ggml_mul_mat(ctx, k, q);
 
-        // Scale and softmax
+        // Create causal mask - KQ additive mask for causal attention
+        // ggml_soft_max_ext expects the mask to be added to logits before softmax
+        // For causal attention, future positions should be -inf
+        struct ggml_tensor * KQ_mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_tokens, n_tokens);
+        ggml_set_name(KQ_mask, "KQ_mask");
+        ggml_set_input(KQ_mask);
+
+        // Scale and softmax with causal mask
         float kq_scale = 1.0f / sqrtf((float)n_embd_head);
-        kq = ggml_soft_max_ext(ctx, kq, nullptr, kq_scale, 0.0f);
+        kq = ggml_soft_max_ext(ctx, kq, KQ_mask, kq_scale, 0.0f);
 
         // Attention output: softmax @ V (transpose V for correct dimensions)
         struct ggml_tensor * v_t = ggml_cont(ctx, ggml_transpose(ctx, v));
         struct ggml_tensor * attn = ggml_mul_mat(ctx, v_t, kq);
 
         // Permute back and reshape
-        attn = ggml_permute(ctx, attn, 0, 2, 1, 3);
-        attn = ggml_cont_2d(ctx, attn, n_embd, n_tokens);
+        attn = ggml_cont(ctx, ggml_permute(ctx, attn, 0, 2, 1, 3));
+        struct ggml_tensor * t10 = ggml_reshape_2d(ctx, attn, n_embd, n_tokens);
+        // attn = ggml_permute(ctx, attn, 0, 2, 1, 3);
+        // attn = ggml_cont(ctx, attn);  // Make contiguous BEFORE reshape
+        // struct ggml_tensor * t10 = ggml_reshape_2d(ctx, attn, n_embd, n_tokens);
+        // attn = ggml_cont_2d(ctx, attn, n_embd, n_tokens);
 
         // Output projection
         struct ggml_tensor * attn_out = ggml_mul_mat(ctx, w_out_proj, attn);
+        ggml_set_name(attn_out, "debug_attn_out");
 
         // Layer scale
         if (w_scale1) {
             attn_out = ggml_mul(ctx, attn_out, w_scale1);
+            ggml_set_name(attn_out, "debug_attn_scaled");
         }
 
         // Residual
         cur = ggml_add(ctx, attn_out, inpSA);
+        ggml_set_name(cur, "debug_after_res1");
 
         // === FFN ===
         struct ggml_tensor * ffn_inp = cur;
@@ -936,6 +1158,21 @@ static std::vector<float> decode(mimi_model & model, const std::vector<std::vect
         if (w_scale1) ggml_backend_tensor_set(w_scale1, L.layer_scale_1->data, 0, ggml_nbytes(L.layer_scale_1));
         if (w_scale2) ggml_backend_tensor_set(w_scale2, L.layer_scale_2->data, 0, ggml_nbytes(L.layer_scale_2));
 
+        // Fill causal mask: mask[i, j] = 0 if i <= j, -inf if i > j
+        // This allows query j to attend to keys 0..j (causal attention)
+        struct ggml_tensor * kq_mask_tensor = ggml_get_tensor(ctx, "KQ_mask");
+        if (kq_mask_tensor) {
+            std::vector<float> mask_data(n_tokens * n_tokens);
+            for (int64_t i = 0; i < n_tokens; i++) {      // key position
+                for (int64_t j = 0; j < n_tokens; j++) {  // query position
+                    // mask[i, j] with i = key, j = query
+                    // Query j can attend to key i if i <= j
+                    mask_data[i + j * n_tokens] = (i <= j) ? 0.0f : -INFINITY;
+                }
+            }
+            ggml_backend_tensor_set(kq_mask_tensor, mask_data.data(), 0, mask_data.size() * sizeof(float));
+        }
+
         // Compute
         enum ggml_status status = ggml_backend_graph_compute(backend, gf);
         if (status != GGML_STATUS_SUCCESS) {
@@ -944,6 +1181,75 @@ static std::vector<float> decode(mimi_model & model, const std::vector<std::vect
             ggml_free(ctx);
             ggml_backend_free(backend);
             return {};
+        }
+
+        // Debug: print intermediate values for layer 0
+        if (il == 0) {
+            // Get norm1 output
+            struct ggml_tensor * dbg_norm1 = ggml_get_tensor(ctx, "debug_norm1");
+            struct ggml_tensor * dbg_qkv = ggml_get_tensor(ctx, "debug_qkv");
+
+            if (dbg_norm1) {
+                std::vector<float> norm1_data(n_embd * n_tokens);
+                ggml_backend_tensor_get(dbg_norm1, norm1_data.data(), 0, norm1_data.size() * sizeof(float));
+                printf("    DEBUG norm1 first 4 at t=0: %.6f %.6f %.6f %.6f\n",
+                       norm1_data[0], norm1_data[1], norm1_data[2], norm1_data[3]);
+                fflush(stdout);
+            }
+
+            if (dbg_qkv) {
+                std::vector<float> qkv_data(3 * n_embd * n_tokens);
+                ggml_backend_tensor_get(dbg_qkv, qkv_data.data(), 0, qkv_data.size() * sizeof(float));
+                printf("    DEBUG qkv Q first 4 at t=0: %.6f %.6f %.6f %.6f\n",
+                       qkv_data[0], qkv_data[1], qkv_data[2], qkv_data[3]);
+                printf("    DEBUG qkv K first 4 at t=0: %.6f %.6f %.6f %.6f\n",
+                       qkv_data[512], qkv_data[513], qkv_data[514], qkv_data[515]);
+                fflush(stdout);
+            }
+
+            // Get Q/K after RoPE
+            struct ggml_tensor * dbg_q_rope = ggml_get_tensor(ctx, "debug_q_rope");
+            struct ggml_tensor * dbg_k_rope = ggml_get_tensor(ctx, "debug_k_rope");
+
+            if (dbg_q_rope) {
+                // Shape: [head_dim, n_head, n_tokens] = [64, 8, 50]
+                std::vector<float> q_rope_data(n_embd_head * n_head * n_tokens);
+                ggml_backend_tensor_get(dbg_q_rope, q_rope_data.data(), 0, q_rope_data.size() * sizeof(float));
+                // First head, first token, first 4 elements
+                printf("    DEBUG Q after RoPE head0 t=0 first 4: %.6f %.6f %.6f %.6f\n",
+                       q_rope_data[0], q_rope_data[1], q_rope_data[2], q_rope_data[3]);
+                // First head, second token (offset by head_dim * n_head = 64*8 = 512)
+                printf("    DEBUG Q after RoPE head0 t=1 first 4: %.6f %.6f %.6f %.6f\n",
+                       q_rope_data[512], q_rope_data[513], q_rope_data[514], q_rope_data[515]);
+                fflush(stdout);
+            }
+
+            // Debug attention outputs
+            struct ggml_tensor * dbg_attn_out = ggml_get_tensor(ctx, "debug_attn_out");
+            struct ggml_tensor * dbg_attn_scaled = ggml_get_tensor(ctx, "debug_attn_scaled");
+            struct ggml_tensor * dbg_after_res1 = ggml_get_tensor(ctx, "debug_after_res1");
+
+            if (dbg_attn_out) {
+                std::vector<float> data(n_embd * n_tokens);
+                ggml_backend_tensor_get(dbg_attn_out, data.data(), 0, data.size() * sizeof(float));
+                printf("    DEBUG attn_out first 4 at t=0: %.6f %.6f %.6f %.6f\n",
+                       data[0], data[1], data[2], data[3]);
+                fflush(stdout);
+            }
+            if (dbg_attn_scaled) {
+                std::vector<float> data(n_embd * n_tokens);
+                ggml_backend_tensor_get(dbg_attn_scaled, data.data(), 0, data.size() * sizeof(float));
+                printf("    DEBUG attn_scaled first 4 at t=0: %.6f %.6f %.6f %.6f\n",
+                       data[0], data[1], data[2], data[3]);
+                fflush(stdout);
+            }
+            if (dbg_after_res1) {
+                std::vector<float> data(n_embd * n_tokens);
+                ggml_backend_tensor_get(dbg_after_res1, data.data(), 0, data.size() * sizeof(float));
+                printf("    DEBUG after_res1 first 4 at t=0: %.6f %.6f %.6f %.6f\n",
+                       data[0], data[1], data[2], data[3]);
+                fflush(stdout);
+            }
         }
 
         // Copy result back
@@ -991,180 +1297,38 @@ static std::vector<float> decode(mimi_model & model, const std::vector<std::vect
     n_tokens_final = n_tokens;  // Update for SEANet
     } // End else block for transformer
 
-    // Step 4: SEANet decoder
-    // init_conv: [d_model, n_tokens] -> [1024, n_tokens]
-    std::vector<float> y;
+    // Step 4: SEANet decoder using GGML (or pure C++ if USE_CPP_SEANET is set)
+    std::vector<float> audio;
     int T_final = n_tokens_final;  // Token count after transformer (T_up)
 
-    if (model.init_conv_w) {
-        const float * w = (const float *)model.init_conv_w->data;
-        const float * b = model.init_conv_b ? (const float *)model.init_conv_b->data : nullptr;
-
-        // Weight shape: [in_ch=512, kernel=7, out_ch=1024]
-        conv1d(y, x, w, b, hp.d_model, 1024, 7, T_final);
-        float ic_min = y[0], ic_max = y[0];
-        for (size_t i = 0; i < y.size(); i++) {
-            if (y[i] < ic_min) ic_min = y[i];
-            if (y[i] > ic_max) ic_max = y[i];
+    // Option to load SEANet input from external binary file (for isolated testing)
+    // Format: int d_model, int seq_len, float data[d_model * seq_len]
+    const char * seanet_input_file = getenv("SEANET_INPUT_BIN");
+    if (seanet_input_file) {
+        printf("  Loading SEANet input from %s...\n", seanet_input_file);
+        FILE * f = fopen(seanet_input_file, "rb");
+        if (!f) {
+            fprintf(stderr, "Error: cannot open %s\n", seanet_input_file);
+            return {};
         }
-        printf("  init_conv: [%d, %d] -> [1024, %d], range [%.4f, %.4f]\n",
-               hp.d_model, T_final, T_final, ic_min, ic_max);
-        printf("    First 4 at ch=0, t=0: %.4f %.4f %.4f %.4f\n",
-               y[0], y[1 * T_final], y[2 * T_final], y[3 * T_final]);
-        apply_elu(y);
-        fflush(stdout);
-    } else {
-        fprintf(stderr, "Warning: init_conv not found, using identity\n");
-        y = x;
+        int d_model_file, seq_len_file;
+        fread(&d_model_file, sizeof(int), 1, f);
+        fread(&seq_len_file, sizeof(int), 1, f);
+        x.resize(d_model_file * seq_len_file);
+        fread(x.data(), sizeof(float), x.size(), f);
+        fclose(f);
+        T_final = seq_len_file;
+        printf("  Loaded SEANet input: D=%d, T=%d\n", d_model_file, seq_len_file);
+        printf("  SEANet input range: [%.4f, %.4f], first 4 ch@t=0: %.4f %.4f %.4f %.4f\n",
+               *std::min_element(x.begin(), x.end()), *std::max_element(x.begin(), x.end()),
+               x[0], x[seq_len_file], x[2*seq_len_file], x[3*seq_len_file]);
     }
 
-    int cur_len = T_final;
-    int cur_ch = 1024;
-
-    // 4 upsampling blocks with ratios [8, 6, 5, 4]
-    int ratios[] = {8, 6, 5, 4};
-    int channels[] = {1024, 512, 256, 128, 64};  // Channels after each block
-
-    for (int i = 0; i < 4; i++) {
-        auto & block = model.seanet_blocks[i];
-        int ratio = ratios[i];
-        int out_ch = channels[i + 1];
-        int in_ch = channels[i];
-
-        if (i == 0) {
-            // Debug: print input to first upsample (after init_conv + ELU)
-            float y_min = y[0], y_max = y[0];
-            for (size_t j = 0; j < y.size(); j++) {
-                if (y[j] < y_min) y_min = y[j];
-                if (y[j] > y_max) y_max = y[j];
-            }
-            printf("  Before upsample[0]: range [%.4f, %.4f]\n", y_min, y_max);
-            printf("    First 4 at ch=0, t=0: %.4f %.4f %.4f %.4f\n",
-                   y[0], y[1 * cur_len], y[2 * cur_len], y[3 * cur_len]);
-            printf("    First 4 at ch=0, t=1: %.4f %.4f %.4f %.4f\n",
-                   y[1], y[1 * cur_len + 1], y[2 * cur_len + 1], y[3 * cur_len + 1]);
-        }
-
-        if (block.upsample_w) {
-            const float * w = (const float *)block.upsample_w->data;
-            const float * b = block.upsample_b ? (const float *)block.upsample_b->data : nullptr;
-
-            // Kernel size = 2 * ratio
-            int kernel = 2 * ratio;
-            std::vector<float> upsampled;
-            // Trim = kernel - stride (like PyTorch's unpad1d(y, (0, K-S)))
-            int trim_end = kernel - ratio;
-            conv_transpose1d(upsampled, y, w, b, in_ch, out_ch, kernel, ratio, cur_len, trim_end);
-
-            // Output length: (in-1)*stride + kernel - trim_end = (in-1)*stride + stride = in*stride
-            int new_len = cur_len * ratio;
-
-            // Debug: print range and first values after upsample
-            if (i == 0) {
-                float up_min = upsampled[0], up_max = upsampled[0];
-                for (size_t j = 0; j < upsampled.size(); j++) {
-                    if (upsampled[j] < up_min) up_min = upsampled[j];
-                    if (upsampled[j] > up_max) up_max = upsampled[j];
-                }
-                printf("    After upsample[0]: range [%.4f, %.4f]\n", up_min, up_max);
-                printf("      First 4 at ch=0, t=0: %.4f %.4f %.4f %.4f\n",
-                       upsampled[0], upsampled[1 * new_len], upsampled[2 * new_len], upsampled[3 * new_len]);
-            }
-
-            // NOTE: No ELU here! ELU is inside the ResBlock
-
-            // Residual block: shortcut(x) + block(ELU→Conv3→ELU→Conv1)
-            if (block.res_conv1_w && block.res_conv2_w) {
-                // Block path: ELU -> Conv3 -> ELU -> Conv1
-                std::vector<float> block_out = upsampled;  // Copy for block path
-                apply_elu(block_out);  // ELU before first conv
-
-                const float * w1 = (const float *)block.res_conv1_w->data;
-                const float * b1 = block.res_conv1_b ? (const float *)block.res_conv1_b->data : nullptr;
-
-                // First conv: compress channels (out_ch -> out_ch/2)
-                std::vector<float> res;
-                conv1d(res, block_out, w1, b1, out_ch, out_ch / 2, 3, new_len);
-
-                if (i == 0) {
-                    float r_min = res[0], r_max = res[0];
-                    for (size_t j = 0; j < res.size(); j++) {
-                        if (res[j] < r_min) r_min = res[j];
-                        if (res[j] > r_max) r_max = res[j];
-                    }
-                    printf("      After Conv3: range [%.4f, %.4f]\n", r_min, r_max);
-                    printf("        First 4: %.4f %.4f %.4f %.4f\n",
-                           res[0], res[1 * new_len], res[2 * new_len], res[3 * new_len]);
-                }
-
-                apply_elu(res);  // ELU after first conv
-
-                const float * w2 = (const float *)block.res_conv2_w->data;
-                const float * b2 = block.res_conv2_b ? (const float *)block.res_conv2_b->data : nullptr;
-
-                // Second conv: expand channels back (out_ch/2 -> out_ch)
-                std::vector<float> res2;
-                conv1d(res2, res, w2, b2, out_ch / 2, out_ch, 1, new_len);
-
-                if (i == 0) {
-                    float r_min = res2[0], r_max = res2[0];
-                    for (size_t j = 0; j < res2.size(); j++) {
-                        if (res2[j] < r_min) r_min = res2[j];
-                        if (res2[j] > r_max) r_max = res2[j];
-                    }
-                    printf("      After Conv1: range [%.4f, %.4f]\n", r_min, r_max);
-                    printf("        First 4: %.4f %.4f %.4f %.4f\n",
-                           res2[0], res2[1 * new_len], res2[2 * new_len], res2[3 * new_len]);
-                }
-
-                // Add residual: shortcut (upsampled) + block (res2)
-                for (size_t j = 0; j < upsampled.size(); j++) {
-                    upsampled[j] += res2[j];
-                }
-
-                if (i == 0) {
-                    float r_min = upsampled[0], r_max = upsampled[0];
-                    for (size_t j = 0; j < upsampled.size(); j++) {
-                        if (upsampled[j] < r_min) r_min = upsampled[j];
-                        if (upsampled[j] > r_max) r_max = upsampled[j];
-                    }
-                    printf("      After residual add: range [%.4f, %.4f]\n", r_min, r_max);
-                    printf("        First 4: %.4f %.4f %.4f %.4f\n",
-                           upsampled[0], upsampled[1 * new_len], upsampled[2 * new_len], upsampled[3 * new_len]);
-                }
-            }
-
-            // ELU after the entire resblock
-            apply_elu(upsampled);
-
-            y = std::move(upsampled);
-            cur_len = new_len;
-            cur_ch = out_ch;
-
-            printf("  upsample[%d]: ratio=%d, [%d, %d] -> [%d, %d]\n",
-                   i, ratio, in_ch, cur_len / ratio, out_ch, cur_len);
-        }
-    }
-
-    // Final conv: [64, L] -> [1, L]
-    std::vector<float> audio;
-    if (model.final_conv_w) {
-        const float * w = (const float *)model.final_conv_w->data;
-        const float * b = model.final_conv_b ? (const float *)model.final_conv_b->data : nullptr;
-
-        conv1d(audio, y, w, b, 64, 1, 3, cur_len);
-        printf("  final_conv: [64, %d] -> [1, %d]\n", cur_len, cur_len);
-    } else {
-        // Just take first channel
-        audio.resize(cur_len);
-        for (int t = 0; t < cur_len; t++) {
-            audio[t] = y[t];
-        }
-    }
-
-    // Apply tanh to clip output
-    for (auto & s : audio) {
-        s = tanhf(s);
+    // GGML-based SEANet (default)
+    audio = seanet_decode_ggml(model, x, T_final);
+    if (audio.empty()) {
+        fprintf(stderr, "Error: SEANet GGML decode failed\n");
+        return {};
     }
 
     // Trim to expected length: T * (sample_rate / frame_rate)
