@@ -1,13 +1,13 @@
 # Mimi Decoder C++ Implementation Progress
 
-## Status: ✅ WORKING (High Correlation with GGML-Compatible Weights)
+## Status: ✅ SEANet GGML WORKING (0.9999 correlation)
 
 ### Test Results (2024-12-14)
 
-| Test | Frames | Duration | Correlation | MAE | Notes |
-|------|--------|----------|-------------|-----|-------|
-| speech_tokens.json | 25 | 2.0s | 0.9986 | 0.0056 | Excellent match |
-| long_tokens.json | 50 | 4.0s | 0.9696 | 0.0210 | Good match, some accumulated error |
+| Component | Correlation | MAE | Notes |
+|-----------|-------------|-----|-------|
+| SEANet GGML (with Python transformer input) | **0.9999** | 0.0019 | Excellent match! |
+| Full pipeline (C++ transformer + SEANet) | ~0.5 | ~0.15 | Transformer output mismatch |
 
 ### Component Validation
 
@@ -15,73 +15,55 @@
 |-----------|--------|-------|
 | Quantizer decode (codebook lookup + sum) | ✅ MATCH | Pure C++ implementation |
 | 2x upsample (ConvTranspose1d) | ✅ MATCH | Fixed end-trimming bug |
-| Decoder transformer (8 layers) | ✅ MATCH | Uses GGML backend |
-| SEANet decoder (4 upsamples + residual blocks) | ✅ MATCH | Fixed ConvTranspose1d trimming |
+| **SEANet decoder (GGML)** | ✅ **0.9999** | Fully converted to GGML ops |
+| Decoder transformer (8 layers) | ❌ MISMATCH | Output values differ from Python |
+
+### SEANet GGML Implementation
+
+The SEANet decoder is now fully implemented using GGML operations:
+- `ggml_conv_1d` - for init_conv, final_conv, residual convolutions
+- `ggml_conv_transpose_1d` - for all 4 upsample layers
+- `ggml_elu` - ELU activation
+- `ggml_add` - bias addition and residual connections
+- `ggml_tanh` - final activation
+
+**Key discoveries:**
+1. `ggml_conv_1d` requires F16 kernel weights (uses im2col internally)
+2. `ggml_conv_transpose_1d` requires manual output trimming via `ggml_view`
+3. Causal padding must be applied manually with `ggml_pad_ext`
+
+### Remaining Issue: Transformer Mismatch
+
+Python transformer output @ t=0: [0.93, 1.72, -0.19, 0.74, ...]
+C++ transformer output @ t=0:   [0.52, 0.28, -0.11, -0.61, ...]
+
+These values are completely different despite using the same input. Need to investigate:
+- Causal mask implementation
+- RoPE (rotary position embeddings)
+- Layer normalization
 
 ### Key Bug Fixes Applied
 
 1. **ConvTranspose1d padding/trimming** (CRITICAL)
    - **Bug**: C++ used symmetric padding (remove from both ends)
    - **Fix**: Changed to end-trimming only (like PyTorch's `unpad1d(y, (0, K-S))`)
-   - **Impact**: Correlation jumped from -0.55 to 0.999+ without transformer
 
 2. **GGUF Weight Layout** (for GGML compatibility)
-   - **Bug**: Converter transposed weights for MLX format `[OC, K, IC]`
-   - **Fix**: Removed transpose - keep PyTorch layout for GGML compatibility
-   - **GGML expects**:
-     - `ggml_conv_1d` kernel: `ne[] = [K, IC, OC]` ← PyTorch `[OC, IC, K]` stored directly
-     - `ggml_conv_transpose_1d` kernel: `ne[] = [K, OC, IC]` ← PyTorch `[IC, OC, K]` stored directly
-   - **Benefit**: Can now memory-map GGUF tensors directly without runtime transformation
+   - **GGML expects**: `ne[] = [K, IC, OC]` for conv1d kernels
+   - Keep PyTorch layout without transpose for GGML compatibility
 
-### Surprises/Learnings
+3. **ggml_conv_1d requires 4D input**
+   - Input tensor must be `[seq_len, in_ch, batch, 1]` (ne[3]=1)
 
-1. **ggml_conv_transpose_1d requires p0=0**: Padding must be 0 in GGML, use `ggml_view` to trim output
-2. **Weight layout confusion**: numpy row-major → GGML column-major, ne[0] is innermost/fastest
-3. **MLX vs GGML formats differ**: Had to undo MLX-specific transposes for GGML compatibility
-4. **Depthwise convtr weight shape**: `[K, OC=1, IC=512]` for per-channel kernels
-
-### Architecture: Hybrid C++/GGML
-
-**Using GGML:**
-- Decoder transformer (self-attention, feed-forward, layer norm)
-
-**Pure C++ (TODO: convert to GGML):**
-- `conv1d()` - standard 1D convolution
-- `conv_transpose1d()` - transposed convolution for upsampling
-- `apply_elu()` - ELU activation
-- Quantizer decode (codebook lookup)
-- SEANet decoder (all conv layers)
-
-### GGML Conversion Backlog
-
-Priority order for converting pure C++ to GGML:
-
-1. **conv1d()** → `ggml_conv_1d`
-   - Used in SEANet init_conv, final_conv, all residual blocks
-   - Critical for consistency and potential Metal/CUDA acceleration
-
-2. **conv_transpose1d()** → `ggml_conv_transpose_1d`
-   - Used for all upsampling layers (4 total in SEANet)
-   - Need to handle end-trimming correctly
-
-3. **apply_elu()** → `ggml_elu`
-   - Used throughout SEANet decoder
-   - Simple conversion
-
-4. **Quantizer decode** → `ggml_get_rows` + `ggml_add`
-   - Codebook lookup and summation across 8 codebooks
-   - Would benefit from batch operations
-
-5. **Full SEANet graph**
-   - Once individual ops are converted, build full computation graph
-   - Enables better optimization and memory management
+4. **ggml_cont not needed after ggml_add**
+   - Removed unnecessary ggml_cont which was causing zeros
 
 ### Files
 
 - **C++ Implementation**: `/Users/ochafik/github/moshi/tools/mimi_decode.cpp`
-- **GGUF Model**: `/tmp/mimi-decoder.gguf` (converted from Moshi weights)
+- **GGUF Model**: `/tmp/mimi-decoder.gguf`
 - **Python Reference**: `/Users/ochafik/github/moshi/scripts/decode_mimi.py`
-- **Debug Script**: `/Users/ochafik/github/moshi/scripts/debug_mimi_intermediate.py`
+- **Debug Script**: `/Users/ochafik/github/moshi/scripts/debug_seanet_intermediate.py`
 
 ### Command Usage
 
@@ -89,13 +71,17 @@ Priority order for converting pure C++ to GGML:
 # Build
 cd build && make mimi_decode
 
-# Run C++ decoder
+# Run with Python SEANet input (for isolated SEANet testing)
+SEANET_INPUT_BIN=/tmp/seanet_input.bin ./mimi_decode /tmp/speech_tokens.json /tmp/output.wav
+
+# Run full pipeline (uses C++ transformer)
 ./mimi_decode /tmp/speech_tokens.json /tmp/output.wav
 
-# Run Python reference
-python scripts/decode_mimi.py /tmp/speech_tokens.json -o /tmp/reference.wav
+# Use pure C++ SEANet (for comparison)
+USE_CPP_SEANET=1 ./mimi_decode /tmp/speech_tokens.json /tmp/output.wav
 ```
 
 ### Environment Variables
 
-- `SKIP_TRANSFORMER=1` - Bypass transformer (for debugging SEANet only)
+- `SEANET_INPUT_BIN` - Path to binary file with SEANet input (for isolated testing)
+- `USE_CPP_SEANET=1` - Use pure C++ SEANet instead of GGML
